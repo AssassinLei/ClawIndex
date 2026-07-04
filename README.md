@@ -197,8 +197,8 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## 注意事项
 
-- `risk_free_rate`（无风险利率）当前为固定值 2.3%，尚未接入真实宏观数据
-- 每日增量数据同步逻辑尚未实现，当前仅在添加标的时拉取历史数据
+- `risk_free_rate`（无风险利率）通过 akshare 获取中国10年期国债收益率，接口异常时默认值 1.72%
+- 每日增量数据同步已实现，支持交易日历自动识别（周末/节假日跳过）
 - SQLite 适合单用户本地使用，多用户并发场景建议迁移至 PostgreSQL
 - 数据库文件 `quant_system.db` 为运行时生成，已加入 `.gitignore`
 
