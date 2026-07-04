@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="claw-grad" x1="12" y1="52" x2="52" y2="12" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <path d="M18 50 C19 34 21 24 23 14" stroke="url(#claw-grad)" stroke-width="4" stroke-linecap="round"/>
+  <path d="M30 50 C30 34 31 22 32 12" stroke="url(#claw-grad)" stroke-width="4" stroke-linecap="round"/>
+  <path d="M42 50 C41 36 40 26 38 16" stroke="url(#claw-grad)" stroke-width="4" stroke-linecap="round"/>
+</svg>

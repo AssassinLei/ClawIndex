@@ -1,0 +1,9 @@
+# AI 指数基金量化盯盘系统之依赖
+# Python 3.9+
+
+streamlit>=1.32.0
+pandas>=2.0.0
+tushare
+openai>=1.12.0
+python-dotenv>=1.0.0
+akshare

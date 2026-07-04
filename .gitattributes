@@ -1,0 +1,21 @@
+# 全局：自动检测文本/二进制，文本文件统一 LF 入库，不警告
+* text=auto
+
+# 明确声明所有代码文件为文本
+.gitattributes text
+*.py text
+*.md text
+*.txt text
+*.json text
+*.yaml text
+*.yml text
+*.toml text
+*.cfg text
+*.ini text
+
+# 二进制格式，禁止 Git 转换换行符
+*.svg binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
