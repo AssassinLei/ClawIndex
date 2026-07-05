@@ -121,9 +121,21 @@ def fetch_risk_free_rate(start_date: str, end_date: str) -> tuple[pd.DataFrame, 
             return pd.DataFrame(), "未找到中债国债收益率曲线数据"
         
         # 提取需要的列
+        try:
+            rate_series = df_cn['10年'].astype(float) / 100  # 百分比转小数
+        except KeyError:
+            # 兼容 akshare 列名变更，查找包含 '10' 和 '年' 的备选列
+            logger.warning(f"bond_china_yield: 未找到 '10年' 列，可用列: {list(df_cn.columns)}")
+            alt_cols = [c for c in df_cn.columns if '10' in c and '年' in c]
+            if alt_cols:
+                logger.info(f"bond_china_yield: 使用备选列 '{alt_cols[0]}'")
+                rate_series = df_cn[alt_cols[0]].astype(float) / 100
+            else:
+                return pd.DataFrame(), f"未找到10年期国债收益率列，可用列: {list(df_cn.columns)}"
+
         result = pd.DataFrame({
             'trade_date': pd.to_datetime(df_cn['日期']).dt.strftime('%Y-%m-%d'),
-            'risk_free_rate': df_cn['10年'].astype(float) / 100  # 百分比转小数
+            'risk_free_rate': rate_series
         })
         
         logger.info(f"bond_china_yield: 提取10年期国债 {len(result)} 行")

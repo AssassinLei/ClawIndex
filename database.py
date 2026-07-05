@@ -1,7 +1,7 @@
 import sqlite3
 import pandas as pd
 import os
-from typing import List, Dict, Any
+from typing import List, Dict
 from logger import setup_logger
 
 logger = setup_logger("database")
@@ -77,12 +77,31 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 列已存在，忽略
     
+    # 表5：Webhook 地址配置
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS webhook_urls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            label TEXT DEFAULT '',
+            created_at DATE DEFAULT (date('now', 'localtime'))
+        )
+    ''')
+    
+    # 表6：应用设置键值存储
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    ''')
+    
     conn.commit()
     conn.close()
     logger.info("数据库初始化完成")
 
 # --- 基金池管理操作 ---
-def add_fund(fund_code: str, fund_name: str, category: str):
+def add_fund(fund_code: str, fund_name: str, category: str) -> bool:
+    """添加基金到监控池，返回 True 表示新增成功，False 表示已存在"""
     conn = get_connection()
     try:
         conn.execute(
@@ -91,8 +110,10 @@ def add_fund(fund_code: str, fund_name: str, category: str):
         )
         conn.commit()
         logger.info(f"add_fund: {fund_code} {fund_name} (category={category})")
+        return True
     except sqlite3.IntegrityError:
         logger.warning(f"add_fund: {fund_code} already exists")
+        return False
     finally:
         conn.close()
 
@@ -151,7 +172,7 @@ def get_latest_trade_date(fund_code: str) -> str:
     )
     result = cursor.fetchone()[0]
     conn.close()
-    return result  # 返回 None 表示无数据
+    return str(result) if result is not None else None  # 返回 None 表示无数据
 
 def get_recent_prices(fund_code: str, days: int = 150) -> pd.DataFrame:
     """获取最近N天的价格，用于计算移动平均线(SMA)等技术指标"""
@@ -178,8 +199,8 @@ def calculate_percentile(fund_code: str, indicator: str, current_value: float, l
     conn = get_connection()
     cursor = conn.cursor()
     
-    # 1. 检查历史总条数
-    cursor.execute(f"SELECT COUNT(*) FROM daily_market_data WHERE fund_code = ? AND {indicator} IS NOT NULL LIMIT ?", (fund_code, lookback_days))
+    # 1. 检查历史总条数（限定在 lookback_days 窗口内，与分位计算保持一致）
+    cursor.execute(f"SELECT COUNT(*) FROM (SELECT {indicator} FROM daily_market_data WHERE fund_code = ? AND {indicator} IS NOT NULL ORDER BY trade_date DESC LIMIT ?)", (fund_code, lookback_days))
     total_count = cursor.fetchone()[0]
     
     if total_count < 100:
@@ -301,3 +322,60 @@ def get_market_data_for_date(fund_code: str, trade_date: str) -> Dict:
     if row:
         return dict(row)
     return {}
+
+# --- Webhook 配置管理 ---
+def get_webhook_urls() -> List[Dict]:
+    """获取所有已保存的 webhook 地址"""
+    conn = get_connection()
+    cursor = conn.execute("SELECT * FROM webhook_urls ORDER BY id")
+    urls = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return urls
+
+def add_webhook_url(url: str, label: str = "") -> bool:
+    """添加一条 webhook 地址，返回 True 表示新增成功，False 表示已存在"""
+    url = url.strip()
+    label = label.strip()
+    conn = get_connection()
+    # 检查是否已存在相同 URL
+    existing = conn.execute("SELECT id FROM webhook_urls WHERE url = ?", (url,)).fetchone()
+    if existing:
+        conn.close()
+        logger.warning(f"add_webhook_url: URL 已存在, id={existing['id']}")
+        return False
+    conn.execute(
+        "INSERT INTO webhook_urls (url, label) VALUES (?, ?)",
+        (url, label)
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"add_webhook_url: {url[:50]}...")
+    return True
+
+def remove_webhook_url(webhook_id: int):
+    """删除指定 webhook 地址"""
+    conn = get_connection()
+    conn.execute("DELETE FROM webhook_urls WHERE id = ?", (webhook_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"remove_webhook_url: id={webhook_id}")
+
+# --- 应用设置管理 ---
+def get_setting(key: str, default: str = "") -> str:
+    """读取应用设置，不存在时返回默认值"""
+    conn = get_connection()
+    cursor = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+def set_setting(key: str, value: str):
+    """写入或更新应用设置"""
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+        (key, value)
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"set_setting: {key} = {value}")

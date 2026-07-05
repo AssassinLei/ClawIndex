@@ -5,10 +5,11 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, save_inspection_result, get_inspection_history, get_market_data_for_date
+from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, save_inspection_result, get_inspection_history, get_market_data_for_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, is_trade_day
 from strategy_engine import generate_fund_report
 from llm_agent import generate_ai_report
+from webhook_sender import send_to_all_webhooks
 from datetime import datetime
 
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -124,6 +125,74 @@ for ind in industries:
         'level': ind['level']
     })
 
+# 操作建议视觉风格映射（巡检页与历史页复用）
+ACTION_STYLES = {
+    "STRONG_BUY": {"color": "#16a34a", "bg": "#f0fdf4", "border": "#22c55e", "icon": "🟢", "label": "强烈加仓"},
+    "BUY_PLAN":   {"color": "#15803d", "bg": "#f0fdf4", "border": "#4ade80", "icon": "🟩", "label": "定投买入"},
+    "HOLD":       {"color": "#d97706", "bg": "#fffbeb", "border": "#f59e0b", "icon": "🟡", "label": "持有观望"},
+    "SELL_PLAN":  {"color": "#dc2626", "bg": "#fef2f2", "border": "#ef4444", "icon": "🔴", "label": "止盈卖出"},
+    "ERROR":      {"color": "#6b7280", "bg": "#f9fafb", "border": "#9ca3af", "icon": "⚠️", "label": "数据异常"},
+}
+
+# --- 巡检卡片渲染辅助函数 ---
+def render_card_header(card: dict):
+    """渲染巡检卡片的彩色标题栏"""
+    st.markdown(f"""
+    <div style="
+        border-left: 5px solid {card['border']};
+        background: {card['bg']};
+        border-radius: 0 12px 12px 0;
+        padding: 16px 20px;
+        margin: 12px 0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    ">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:4px;">
+            <span style="font-size:1.6rem;">{card['icon']}</span>
+            <span style="font-size:1.2rem; font-weight:700; color:{card['color']};">{card['name']} · {card['label']}</span>
+            <span style="font-size:0.85rem; color:#6b7280; margin-left:auto;">{card['code']} · {card['date']}</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_card_expander(card: dict, expanded: bool = False):
+    """渲染巡检卡片的展开详情"""
+    with st.expander(f"{card['icon']} {card['name']}", expanded=expanded):
+        if card.get('has_error'):
+            st.error(f"⚠️ {card.get('error_msg', '未知错误')}")
+        else:
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.subheader(card['name'], anchor=False)
+                inds = card.get('indicators', {})
+                st.metric(label="当前价格", value=round(inds.get('price', 0), 3) if inds.get('price') else "N/A")
+                st.metric(label="当前市盈率 (PE)", value=round(inds.get('pe', 0), 2) if inds.get('pe') else "N/A")
+                st.metric(label="历史PE分位数", value=f"{round(inds.get('pe_percentile', 0)*100, 2)}%" if inds.get('pe_percentile') else "N/A")
+                st.subheader("韬略", anchor=False)
+                details = card.get('details', [])
+                if details:
+                    for detail in details:
+                        st.markdown(f"<div style='color:#1a1a1a; font-weight:500; font-size:0.92rem; margin:4px 0;'>- {detail}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='color:#1a1a1a; font-weight:500; font-size:0.92rem;'>- 无（数据异常）</div>", unsafe_allow_html=True)
+            with col2:
+                st.subheader("AI 投顾解读", anchor=False)
+                ai_text = card.get('ai_report', '')
+                if ai_text:
+                    clean_r = re.sub(r'^#{1,6}\s+(.+)$', r'**\1**', ai_text, flags=re.MULTILINE)
+                    if card.get('has_error'):
+                        st.warning(clean_r)
+                    else:
+                        st.info(clean_r)
+                else:
+                    st.caption("- 无 AI 报告")
+
+# --- 侧边栏：巡检进行中提示 ---
+if st.session_state.get("inspection_active", False):
+    idx = st.session_state.get("inspection_index", 0)
+    total = st.session_state.get("inspection_total", 0)
+    st.sidebar.warning(f"⏳ 巡检进行中 ({idx}/{total})")
+
 # --- 侧边栏：基金池管理 ---
 st.sidebar.header("⚙️ 监控池管理")
 st.sidebar.subheader("添加行业指数")
@@ -235,16 +304,20 @@ if selected_industry:
     st.sidebar.info(f"已选择: {new_name} ({new_code})\n层级: {level}")
     
     if st.sidebar.button("添加监控", type="primary"):
-        add_fund(new_code, new_name, new_cat[0])
-        st.sidebar.success(f"已添加 {new_name}")
-        # 同步历史数据
-        with st.spinner(f'正在拉取 {new_code} 的近10年历史数据...'):
-            success, msg = sync_all_history(new_code)
-        if success:
-            st.sidebar.success(msg)
+        added = add_fund(new_code, new_name, new_cat[0])
+        if not added:
+            st.sidebar.warning(f"{new_name} 已在监控池中，无需重复添加")
+            st.rerun()
         else:
-            st.sidebar.error(f"数据同步失败：{msg}")
-        st.rerun()
+            st.sidebar.success(f"已添加 {new_name}")
+            # 同步历史数据
+            with st.spinner(f'正在拉取 {new_code} 的近10年历史数据...'):
+                success, msg = sync_all_history(new_code)
+            if success:
+                st.sidebar.success(msg)
+            else:
+                st.sidebar.error(f"数据同步失败：{msg}")
+            st.rerun()
 
 st.sidebar.divider()
 st.sidebar.subheader("当前监控列表")
@@ -277,6 +350,59 @@ if funds:
 else:
     st.sidebar.info("监控池为空，请先添加基金。")
 
+# --- 侧边栏：消息推送设置 ---
+st.sidebar.divider()
+st.sidebar.header("📨 消息推送设置")
+
+# 巡检推送开关
+webhook_enabled = get_setting("webhook_inspection_enabled", "false")
+current_enabled = webhook_enabled == "true"
+new_enabled = st.sidebar.toggle(
+    "巡检时发送消息推送",
+    value=current_enabled,
+    help="开启后，每次巡检将为每个指数向已配置的 webhook 地址发送卡片消息",
+)
+if new_enabled != current_enabled:
+    set_setting("webhook_inspection_enabled", "true" if new_enabled else "false")
+    st.rerun()
+
+# Webhook 地址管理
+st.sidebar.caption("Webhook 地址管理（飞书自定义机器人）")
+
+with st.sidebar.form("add_webhook_form", clear_on_submit=True):
+    new_url = st.text_input("Webhook URL", placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...", key="wh_url")
+    new_label = st.text_input("备注标签（选填）", placeholder="例如：公司群机器人", key="wh_label")
+    submitted = st.form_submit_button("添加 Webhook", type="primary")
+    if submitted:
+        if new_url.strip():
+            added = add_webhook_url(new_url.strip(), new_label.strip())
+            if added:
+                st.sidebar.success("已添加 Webhook 地址")
+            else:
+                st.sidebar.warning("该 Webhook 地址已存在，无需重复添加")
+            st.rerun()
+        else:
+            st.sidebar.warning("请输入 Webhook URL")
+
+# 已保存的 webhook 列表
+webhook_urls = get_webhook_urls()
+if webhook_urls:
+    for wh in webhook_urls:
+        wh_label = wh.get("label", "") or "未命名"
+        wh_url = wh.get("url", "")
+        # 截断显示 URL
+        display_url = wh_url[:50] + "..." if len(wh_url) > 50 else wh_url
+        col1, col2 = st.sidebar.columns([5, 1])
+        with col1:
+            st.caption(f"📎 {wh_label}")
+            st.caption(f"{display_url}")
+        with col2:
+            if st.button("🗑️", key=f"del_wh_{wh['id']}", help="删除此 Webhook"):
+                remove_webhook_url(wh["id"])
+                st.rerun()
+else:
+    st.sidebar.caption("暂无 Webhook 地址，请添加")
+
 
 # --- 主页面：巡检核心工作流 ---
 logo_svg = LOGO_PATH.read_text(encoding="utf-8")
@@ -295,114 +421,150 @@ st.markdown("策略不动摇，AI助决断。")
 tab1, tab2 = st.tabs(["巡检", "历史分析"])
 
 with tab1:
-    if st.button("🚀 运行今日行情抓取与策略巡检", type="primary", use_container_width=True):
-        if not funds:
-            st.warning("监控池为空，请先在左侧添加。")
-        else:
+    # --- 巡检按钮（仅非活跃状态显示）---
+    if not st.session_state.get("inspection_active", False):
+        if st.button("🚀 运行今日行情抓取与策略巡检", type="primary", use_container_width=True):
+            if not funds:
+                st.warning("监控池为空，请先在左侧添加。")
+            else:
+                st.session_state.inspection_active = True
+                st.session_state.inspection_fund_list = list(funds)  # 快照当前监控列表
+                st.session_state.inspection_index = 0
+                st.session_state.inspection_total = len(funds)
+                st.session_state.inspection_cards = []
+                st.rerun()
+
+    # ============================================================
+    # 巡检状态机：利用 session_state 跨 rerun 持久化进度
+    # 每次脚本执行只处理一个标的，然后 st.rerun() 推进到下一个
+    # 这样即使侧边栏交互触发 rerun，巡检也不会丢失
+    # ============================================================
+    if st.session_state.get("inspection_active", False):
+        funds_list = st.session_state.inspection_fund_list
+        idx = st.session_state.inspection_index
+        total = st.session_state.inspection_total
+        processed_cards = st.session_state.get("inspection_cards", [])
+        # 防重入：独立集合在「处理开始前」就写入，防止侧边栏交互触发 rerun 导致重复
+        processed_codes = st.session_state.get("_processed_codes", set())
+
+        st.header("📊 巡检报告", anchor=False)
+        progress_bar = st.progress(idx / max(total, 1))
+        progress_text = st.caption(f"已分析 {idx}/{total}")
+
+        # 重渲染已完成的卡片
+        for card in processed_cards:
+            render_card_header(card)
+            render_card_expander(card, expanded=True)
+
+        # 处理当前标的
+        if idx < total:
+            fund = funds_list[idx]
+            code = fund['fund_code']
+            name = fund['fund_name']
+            cat = fund['category']
+
+            # 防重入：若标记 + 卡片均已写入，说明本轮完整结束，跳过
+            if code in processed_codes:
+                if any(c['code'] == code for c in processed_cards):
+                    # 卡片已存 → 确实已完成，推进到下一标的
+                    st.session_state.inspection_index = idx + 1
+                    if idx + 1 >= total:
+                        st.session_state.inspection_active = False
+                        st.success("🎉 所有指数巡检完毕！")
+                        st.rerun()
+                    else:
+                        st.rerun()
+                else:
+                    # 标记在但卡片不在 → 上一轮被打断，清标记重新处理
+                    processed_codes.discard(code)
+                    st.session_state._processed_codes = processed_codes
+
+            # 立刻打标记，后续任何 rerun 都不会再进入本轮
+            processed_codes.add(code)
+            st.session_state._processed_codes = processed_codes
+
+            # 1. 增量同步
+            sync_error = None
+            with st.spinner(f'正在同步 {name} ({code}) 最新数据...'):
+                sync_success, sync_msg = sync_incremental(code)
+                if not sync_success:
+                    sync_error = sync_msg
+
+            # 2. 策略引擎
+            if sync_error:
+                fund_data = {"error": f"数据同步失败: {sync_error}"}
+            else:
+                fund_data = generate_fund_report(code, cat)
+                fund_data["fund_name"] = name  # 供 webhook 标题使用
+
+            # 3. AI 报告
+            ai_report = generate_ai_report(fund_data)
+
+            # 4. 确定视觉风格
+            has_error = 'error' in fund_data
+            action = fund_data.get('decision', {}).get('action', 'ERROR')
+            if has_error:
+                style = ACTION_STYLES["ERROR"]
+            else:
+                style = ACTION_STYLES.get(action, ACTION_STYLES["HOLD"])
+
+            # 5. 保存结果
+            save_inspection_result(code, name, action if not has_error else "ERROR", ai_report)
+
+            # 6. Webhook 推送
+            if new_enabled:
+                wh_urls = get_webhook_urls()
+                if wh_urls:
+                    send_to_all_webhooks(wh_urls, fund_data, ai_report)
+
+            # 7. 构建渲染数据 & 渲染当前卡片
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            current_card = {
+                'code': code,
+                'name': name,
+                'date': today_str,
+                'icon': style['icon'],
+                'color': style['color'],
+                'border': style['border'],
+                'bg': style['bg'],
+                'label': style['label'],
+                'has_error': has_error,
+                'error_msg': fund_data.get('error', '') if has_error else '',
+                'indicators': fund_data.get('indicators', {}),
+                'details': fund_data.get('decision', {}).get('details', []),
+                'ai_report': ai_report,
+            }
+            render_card_header(current_card)
+            render_card_expander(current_card, expanded=True)
+
+            # 8. 存入已处理列表
+            processed_cards.append(current_card)
+            st.session_state.inspection_cards = processed_cards
+            st.session_state.inspection_index = idx + 1
+
+            # 刷新进度条，反映刚刚完成的标的
+            progress_bar.progress((idx + 1) / max(total, 1))
+            progress_text.caption(f"已分析 {idx + 1}/{total}")
+
+            if idx + 1 >= total:
+                # 全部完成
+                st.session_state.inspection_active = False
+                if "_processed_codes" in st.session_state:
+                    del st.session_state._processed_codes
+                st.success("🎉 所有指数巡检完毕！")
+                st.rerun()
+            else:
+                st.rerun()
+
+    # 巡检完成后展示结果（非活跃状态但 inspection_cards 有数据）
+    else:
+        completed_cards = st.session_state.get("inspection_cards", [])
+        if completed_cards:
             st.header("📊 巡检报告", anchor=False)
-            
-            # 进度展示
-            total_funds = len(funds)
-            progress_bar = st.progress(0)
-            progress_text = st.caption(f"准备分析 {total_funds} 个指数...")
-            
-            for i, fund in enumerate(funds):
-                code = fund['fund_code']
-                name = fund['fund_name']
-                cat = fund['category']
-                
-                # 1. 增量同步：从数据库最新日期到今天的行情数据
-                sync_error = None
-                with st.spinner(f'正在同步 {name} ({code}) 最新数据...'):
-                    sync_success, sync_msg = sync_incremental(code)
-                    if not sync_success:
-                        sync_error = sync_msg
-                
-                # 如果增量同步失败，跳过策略引擎，直接显示错误
-                if sync_error:
-                    fund_data = {"error": f"数据同步失败: {sync_error}"}
-                else:
-                    # 2. 策略引擎介入 (硬逻辑计算)
-                    fund_data = generate_fund_report(code, cat)
-                
-                # 3. AI 报告生成
-                ai_report = generate_ai_report(fund_data)
-                
-                # 4. 前端渲染展示
-                has_error = 'error' in fund_data
-                action = fund_data.get('decision', {}).get('action', 'ERROR')
-                
-                # 根据 Action 确定视觉风格
-                ACTION_STYLES = {
-                    "STRONG_BUY": {"color": "#16a34a", "bg": "#f0fdf4", "border": "#22c55e", "icon": "🟢", "label": "强烈加仓"},
-                    "BUY_PLAN":   {"color": "#15803d", "bg": "#f0fdf4", "border": "#4ade80", "icon": "🟩", "label": "定投买入"},
-                    "HOLD":       {"color": "#d97706", "bg": "#fffbeb", "border": "#f59e0b", "icon": "🟡", "label": "持有观望"},
-                    "SELL_PLAN":  {"color": "#dc2626", "bg": "#fef2f2", "border": "#ef4444", "icon": "🔴", "label": "止盈卖出"},
-                    "ERROR":      {"color": "#6b7280", "bg": "#f9fafb", "border": "#9ca3af", "icon": "⚠️", "label": "数据异常"},
-                }
-                
-                if has_error:
-                    style = ACTION_STYLES["ERROR"]
-                else:
-                    style = ACTION_STYLES.get(action, ACTION_STYLES["HOLD"])
-                
-                # 保存巡检结果到数据库（含 AI 报告）
-                save_inspection_result(code, name, action if not has_error else "ERROR", ai_report)
-                
-                # 渲染卡片
-                st.markdown(f"""
-                <div style="
-                    border-left: 5px solid {style['border']};
-                    background: {style['bg']};
-                    border-radius: 0 12px 12px 0;
-                    padding: 16px 20px;
-                    margin: 12px 0;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-                ">
-                    <div style="display:flex; align-items:center; gap:10px; margin-bottom:4px;">
-                        <span style="font-size:1.6rem;">{style['icon']}</span>
-                        <span style="font-size:1.2rem; font-weight:700; color:{style['color']};">{name} · {style['label']}</span>
-                        <span style="font-size:0.85rem; color:#6b7280; margin-left:auto;">{code} · {datetime.now().strftime('%Y-%m-%d')}</span>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                with st.expander(f"{style['icon']} {name}", expanded=True):
-                    if has_error:
-                        st.error(f"⚠️ {fund_data.get('error', '未知错误')}")
-                    
-                    col1, col2 = st.columns([1, 2])
-                    
-                    with col1:
-                        st.subheader(name, anchor=False)
-                        inds = fund_data.get('indicators', {})
-                        st.metric(label="当前价格", value=round(inds.get('price', 0), 3) if inds.get('price') else "N/A")
-                        st.metric(label="当前市盈率 (PE)", value=round(inds.get('pe', 0), 2) if inds.get('pe') else "N/A")
-                        st.metric(label="历史PE分位数", value=f"{round(inds.get('pe_percentile', 0)*100, 2)}%" if inds.get('pe_percentile') else "N/A")
-                        
-                        st.subheader("韬略", anchor=False)
-                        details = fund_data.get('decision', {}).get('details', [])
-                        if details:
-                            for detail in details:
-                                st.markdown(f"<div style='color:#1a1a1a; font-weight:500; font-size:0.92rem; margin:4px 0;'>- {detail}</div>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<div style='color:#1a1a1a; font-weight:500; font-size:0.92rem;'>- 无（数据异常）</div>", unsafe_allow_html=True)
-                            
-                    with col2:
-                        st.subheader("AI 投顾解读", anchor=False)
-                        # 将 AI 报告中的标题语法转为粗体，避免 Streamlit 渲染锚点链接
-                        clean_report = re.sub(r'^#{1,6}\s+', '**', ai_report, flags=re.MULTILINE)
-                        clean_report = re.sub(r'\*\*([^*]+)\*\*\s*$', '**\1**', clean_report, flags=re.MULTILINE)
-                        if has_error:
-                            st.warning(clean_report)
-                        else:
-                            st.info(clean_report)
-                
-                # 更新进度
-                progress_bar.progress((i + 1) / total_funds)
-                progress_text.text(f"已分析 {i + 1}/{total_funds}")
-                
             st.success("🎉 所有指数巡检完毕！")
+            for card in completed_cards:
+                render_card_header(card)
+                render_card_expander(card, expanded=True)
 
 with tab2:
     st.subheader("📋 历史巡检记录", anchor=False)
@@ -460,18 +622,9 @@ with tab2:
         if not filtered_records:
             st.info("筛选条件无匹配记录。")
         else:
-            # 复用巡检页的颜色配置
-            HISTORY_STYLES = {
-                "STRONG_BUY": {"color": "#16a34a", "bg": "#f0fdf4", "border": "#22c55e", "icon": "🟢", "label": "强烈加仓"},
-                "BUY_PLAN":   {"color": "#15803d", "bg": "#f0fdf4", "border": "#4ade80", "icon": "🟩", "label": "定投买入"},
-                "HOLD":       {"color": "#d97706", "bg": "#fffbeb", "border": "#f59e0b", "icon": "🟡", "label": "持有观望"},
-                "SELL_PLAN":  {"color": "#dc2626", "bg": "#fef2f2", "border": "#ef4444", "icon": "🔴", "label": "止盈卖出"},
-                "ERROR":      {"color": "#6b7280", "bg": "#f9fafb", "border": "#9ca3af", "icon": "⚠️", "label": "数据异常"},
-            }
-            
             for record in filtered_records:
                 act = record.get('action', 'HOLD')
-                s = HISTORY_STYLES.get(act, HISTORY_STYLES["HOLD"])
+                s = ACTION_STYLES.get(act, ACTION_STYLES["HOLD"])
                 
                 # 标题卡
                 st.markdown(f"""
@@ -513,8 +666,7 @@ with tab2:
                     st.markdown("**AI 投顾解读**")
                     ai_text = record.get('ai_report', '')
                     if ai_text:
-                        clean_report = re.sub(r'^#{1,6}\s+', '**', ai_text, flags=re.MULTILINE)
-                        clean_report = re.sub(r'\*\*([^*]+)\*\*\s*$', '**\1**', clean_report, flags=re.MULTILINE)
+                        clean_report = re.sub(r'^#{1,6}\s+(.+)$', r'**\1**', ai_text, flags=re.MULTILINE)
                         st.info(clean_report)
                     else:
                         st.caption("- 无 AI 报告")

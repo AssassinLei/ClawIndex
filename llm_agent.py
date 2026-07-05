@@ -29,9 +29,9 @@ def generate_ai_report(fund_data: Dict) -> str:
     decision = fund_data['decision']
     
     # 格式化指标用于提示词
-    pe_str = f"{inds['pe']:.2f}" if inds['pe'] else "无数据"
-    pe_pct_str = f"{inds['pe_percentile']*100:.2f}%" if inds['pe_percentile'] else "无数据"
-    roe_str = f"{inds['roe']*100:.2f}%" if inds['roe'] else "无数据"
+    pe_str = f"{inds['pe']:.2f}" if inds['pe'] is not None else "无数据"
+    pe_pct_str = f"{inds['pe_percentile']*100:.2f}%" if inds['pe_percentile'] is not None else "无数据"
+    roe_str = f"{inds['roe']*100:.2f}%" if inds['roe'] is not None else "无数据"
     
     # 构建 System Prompt
     system_prompt = """

@@ -62,6 +62,7 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
         "ma60": ma60,
         "ma120": ma120,
         "pe": pe,
+        "pb": pb,
         "pe_percentile": pe_percentile,
         "pb_percentile": pb_percentile,
         "roe": roe,
@@ -121,8 +122,8 @@ def _apply_hard_rules(category: str, inds: dict) -> dict:
                 action = "STRONG_BUY"
                 logic_details.append("估值便宜 (PE分位<30%) 且站上120日牛熊线，右侧信号确立，执行买入。")
             elif pe_pct < 0.10:
-                 action = "BUY_PLAN"
-                 logic_details.append("估值极度压缩 (PE分位<10%)，但均线处于空头，只进行小资金试探定投。")
+                action = "BUY_PLAN"
+                logic_details.append("估值极度压缩 (PE分位<10%)，但均线处于空头，只进行小资金试探定投。")
             elif price < ma120:
                 action = "HOLD"
                 logic_details.append("趋势破位 (跌破120日线)，暂停加仓，保护本金。")
