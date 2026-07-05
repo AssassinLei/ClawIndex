@@ -418,12 +418,12 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 st.markdown("策略不动摇，AI助决断。")
 
-tab1, tab2 = st.tabs(["巡检", "历史分析"])
+tab1, tab2 = st.tabs(["研判", "历史分析"])
 
 with tab1:
     # --- 巡检按钮（仅非活跃状态显示）---
     if not st.session_state.get("inspection_active", False):
-        if st.button("🚀 运行今日行情抓取与策略巡检", type="primary", use_container_width=True):
+        if st.button("🚀 运行今日行情研判", type="primary", use_container_width=True):
             if not funds:
                 st.warning("监控池为空，请先在左侧添加。")
             else:
