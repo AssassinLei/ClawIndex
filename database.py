@@ -2,12 +2,17 @@ import sqlite3
 import pandas as pd
 import os
 from typing import List, Dict, Any
+from logger import setup_logger
+
+logger = setup_logger("database")
 
 DB_NAME = "quant_system.db"
 
 def get_connection():
     # 确保返回的行是字典格式，方便读取字段
     conn = sqlite3.connect(DB_NAME)
+    # 启用 WAL 模式：读写可并发，提升巡检写入时的查询性能
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -53,8 +58,28 @@ def init_db():
         )
     ''')
     
+    # 表4：巡检结果记录
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS inspection_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            fund_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            ai_report TEXT,
+            inspect_date DATE DEFAULT (date('now', 'localtime')),
+            UNIQUE(fund_code, inspect_date)
+        )
+    ''')
+    
+    # 兼容旧表：如果已有 inspection_log 但缺少 ai_report 列，则追加
+    try:
+        cursor.execute("ALTER TABLE inspection_log ADD COLUMN ai_report TEXT")
+    except sqlite3.OperationalError:
+        pass  # 列已存在，忽略
+    
     conn.commit()
     conn.close()
+    logger.info("数据库初始化完成")
 
 # --- 基金池管理操作 ---
 def add_fund(fund_code: str, fund_name: str, category: str):
@@ -65,8 +90,9 @@ def add_fund(fund_code: str, fund_name: str, category: str):
             (fund_code, fund_name, category)
         )
         conn.commit()
+        logger.info(f"add_fund: {fund_code} {fund_name} (category={category})")
     except sqlite3.IntegrityError:
-        print(f"Fund {fund_code} already exists.")
+        logger.warning(f"add_fund: {fund_code} already exists")
     finally:
         conn.close()
 
@@ -76,6 +102,7 @@ def remove_fund(fund_code: str):
     conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
     conn.commit()
     conn.close()
+    logger.info(f"remove_fund: {fund_code}，已清理行情数据")
 
 def get_all_funds() -> List[Dict]:
     conn = get_connection()
@@ -111,6 +138,7 @@ def save_daily_data(df: pd.DataFrame):
 
     conn.commit()
     conn.close()
+    logger.info(f"save_daily_data: 写入 {len(rows)} 行行情数据")
 
 # --- 核心：策略查询依赖 ---
 def get_latest_trade_date(fund_code: str) -> str:
@@ -201,6 +229,7 @@ def save_industry_list(df: pd.DataFrame):
     
     conn.commit()
     conn.close()
+    logger.info(f"save_industry_list: 写入 {len(rows)} 条行业分类")
 
 def get_all_industries() -> List[Dict]:
     """获取所有行业分类数据"""
@@ -218,3 +247,57 @@ def get_industry_count() -> int:
     count = cursor.fetchone()[0]
     conn.close()
     return count
+
+def save_inspection_result(fund_code: str, fund_name: str, action: str, ai_report: str = ""):
+    """保存巡检结果（同一标的同一天覆盖更新）"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO inspection_log (fund_code, fund_name, action, ai_report, inspect_date)
+        VALUES (?, ?, ?, ?, date('now', 'localtime'))
+    """, (fund_code, fund_name, action, ai_report))
+    conn.commit()
+    conn.close()
+    logger.info(f"save_inspection_result: {fund_code} {fund_name} action={action}")
+
+def get_inspection_history(fund_code: str = None, action: str = None,
+                           start_date: str = None, end_date: str = None) -> List[Dict]:
+    """查询巡检历史记录，支持多条件筛选，按日期倒序。"""
+    conn = get_connection()
+    query = "SELECT * FROM inspection_log WHERE 1=1"
+    params = []
+    
+    if fund_code:
+        query += " AND fund_code = ?"
+        params.append(fund_code)
+    if action:
+        query += " AND action = ?"
+        params.append(action)
+    if start_date:
+        query += " AND inspect_date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND inspect_date <= ?"
+        params.append(end_date)
+    
+    query += " ORDER BY inspect_date DESC, id DESC"
+    
+    cursor = conn.execute(query, params)
+    records = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    logger.info(f"get_inspection_history: 返回 {len(records)} 条记录")
+    return records
+
+def get_market_data_for_date(fund_code: str, trade_date: str) -> Dict:
+    """查询指定标的在某日的行情数据（close_price, pe, pb, risk_free_rate）"""
+    conn = get_connection()
+    cursor = conn.execute("""
+        SELECT close_price, pe, pb, risk_free_rate
+        FROM daily_market_data
+        WHERE fund_code = ? AND trade_date = ?
+    """, (fund_code, trade_date))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {}

@@ -1,5 +1,8 @@
 import pandas as pd
 from database import get_recent_prices, calculate_percentile, get_connection
+from logger import setup_logger
+
+logger = setup_logger("strategy_engine")
 
 def calculate_technical_indicators(df_prices: pd.DataFrame) -> dict:
     """基于近期价格，计算技术面指标"""
@@ -28,6 +31,7 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
     conn.close()
     
     if not latest_data:
+        logger.warning(f"generate_fund_report: {fund_code} 无行情数据")
         return {"error": f"数据库中未找到 {fund_code} 的行情数据，请检查：1) 标的是否已添加 2) 历史数据是否同步成功 3) 标的代码格式是否正确（如 000300.SH）"}
         
     latest_data = dict(latest_data)
@@ -67,7 +71,8 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
     # 4. 【核心硬逻辑】分支判定，输出强结构化信号
     signal = _apply_hard_rules(category, indicators)
     
-    # 将原始数据与判定结果一并返回
+    logger.info(f"generate_fund_report: {fund_code} (category={category}) PE={pe} PB={pb} PE%={pe_percentile} action={signal['action']}")
+    
     return {
         "fund_code": fund_code,
         "category": category,

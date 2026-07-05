@@ -15,6 +15,8 @@
 - 🎯 **分类策略引擎** — 宽基指数、科技成长、周期制造、红利收息四套独立规则树
 - 🤖 **AI 投顾简报** — 基于人工智能大模型生成中文投资简报
 - 🖥️ **Streamlit 交互界面** — 一键巡检，卡片化渲染，颜色区分买卖信号
+- 📋 **历史分析页面** — 查看每次巡检记录，回溯当日 PE/PB 数据与 AI 解读
+- 📝 **统一日志系统** — 所有 API 调用、数据库操作自动记录至 `logs/clawindex.log`
 
 ## 策略规则概览
 
@@ -33,6 +35,7 @@
 | **Streamlit** | Web 交互界面 |
 | **Pandas** | 数据处理与分析 |
 | **Tushare** | 指数行情与估值数据 |
+| **Akshare** | 中国国债收益率数据 |
 | **OpenAI SDK** | LLM 投顾简报生成 |
 | **SQLite** | 本地持久化存储 |
 
@@ -88,12 +91,14 @@ ClawIndex/
 ├── assets/                  # 静态资源（Logo 等）
 ├── .env                     # 环境变量配置（不提交至 Git）
 ├── app.py                   # Streamlit 前端 & 主工作流
-├── data_fetcher.py          # Tushare 数据采集层
+├── data_fetcher.py          # Tushare/Akshare 数据采集层
 ├── database.py              # SQLite 数据层 & 查询 API
 ├── strategy_engine.py       # 硬逻辑策略引擎
 ├── llm_agent.py             # LLM 投顾简报生成
+├── logger.py                # 统一日志模块
 ├── requirements.txt         # Python 依赖
-└── quant_system.db          # SQLite 数据库文件（运行时生成）
+├── quant_system.db          # SQLite 数据库文件（运行时生成）
+└── logs/                    # 运行日志（按天轮转，保留 30 天）
 ```
 
 ## 使用方式
@@ -199,6 +204,8 @@ sudo nginx -t && sudo systemctl reload nginx
 
 - `risk_free_rate`（无风险利率）通过 akshare 获取中国10年期国债收益率，接口异常时默认值 1.72%
 - 每日增量数据同步已实现，支持交易日历自动识别（周末/节假日跳过）
+- 巡检结果自动存入 `inspection_log` 表，支持历史追溯查看
+- 系统日志按天写入 `logs/clawindex.log`，自动轮转保留最近 30 天，已加入 `.gitignore`
 - SQLite 适合单用户本地使用，多用户并发场景建议迁移至 PostgreSQL
 - 数据库文件 `quant_system.db` 为运行时生成，已加入 `.gitignore`
 

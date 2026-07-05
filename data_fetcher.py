@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 import time
 import os
 from database import save_daily_data, get_connection, get_latest_trade_date, save_industry_list
+from logger import setup_logger
+
+logger = setup_logger("data_fetcher")
 
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 if not TUSHARE_TOKEN:
@@ -46,7 +49,7 @@ def is_trade_day(date_str: str) -> tuple[bool, str]:
         _trade_cal_cache[clean_date] = result
         return result
     except Exception as e:
-        print(f"[trade_cal] 查询失败: {e}")
+        logger.warning(f"trade_cal 查询失败: {e}")
         # 回退到周末判断
         dt = datetime.strptime(clean_date, '%Y%m%d')
         is_weekend = dt.weekday() >= 5
@@ -63,24 +66,24 @@ def fetch_industry_classify() -> tuple[bool, str]:
     
     for level in ['L1', 'L2', 'L3']:
         try:
-            print(f"[index_classify] 拉取 {level}...")
+            logger.info(f"index_classify {level}: 拉取...")
             df = pro.index_classify(level=level, src='SW2021')
-            print(f"[index_classify] {level} 返回: {len(df)} 行")
+            logger.info(f"index_classify {level}: 返回 {len(df)} 行")
             if not df.empty:
-                print(f"[index_classify] {level} 前3行:\n{df.head(3)}")
+                logger.debug(f"index_classify {level} 前3行:\n{df.head(3)}")
             if df.empty:
                 errors.append(f"{level}: 返回空数据")
                 continue
             
             save_industry_list(df)
             total_count += len(df)
-            print(f"[index_classify] 成功同步 {level} 行业 {len(df)} 条")
+            logger.info(f"index_classify: 成功同步 {level} 行业 {len(df)} 条")
             
             # 防限流
             time.sleep(0.5)
         except Exception as e:
             error_msg = f"{level}: {type(e).__name__}: {str(e)}"
-            print(f"[ERROR] [index_classify] {error_msg}")
+            logger.error(f"index_classify: {error_msg}")
             errors.append(error_msg)
     
     if errors:
@@ -99,8 +102,15 @@ def fetch_risk_free_rate(start_date: str, end_date: str) -> tuple[pd.DataFrame, 
     返回: (DataFrame, error_message)
     """
     try:
-        df = ak.bond_china_yield(start_date=start_date, end_date=end_date)
-        print(f"[bond_china_yield] 返回: {len(df)} 行")
+        # 若截止日为非交易日，自动调整为最近交易日，确保获取最新可用收益率
+        query_end = end_date
+        is_open, prev_trade_day = is_trade_day(end_date)
+        if not is_open and prev_trade_day:
+            query_end = prev_trade_day
+            logger.info(f"bond_china_yield: 截止日 {end_date} 为非交易日，调整至 {query_end}")
+        
+        df = ak.bond_china_yield(start_date=start_date, end_date=query_end)
+        logger.info(f"bond_china_yield: 返回 {len(df)} 行")
         
         if df.empty:
             return pd.DataFrame(), "bond_china_yield 接口返回空数据"
@@ -116,12 +126,23 @@ def fetch_risk_free_rate(start_date: str, end_date: str) -> tuple[pd.DataFrame, 
             'risk_free_rate': df_cn['10年'].astype(float) / 100  # 百分比转小数
         })
         
-        print(f"[bond_china_yield] 提取10年期国债: {len(result)} 行")
+        logger.info(f"bond_china_yield: 提取10年期国债 {len(result)} 行")
+        
+        # 检查最新数据日期是否落后于请求范围，结合交易日历给出说明
+        if not result.empty:
+            max_date = result['trade_date'].max()
+            if end_date and max_date < end_date:
+                is_open, _ = is_trade_day(end_date)
+                if not is_open:
+                    logger.info(f"bond_china_yield: 最新数据 {max_date}, 请求截止日 {end_date} 为非交易日")
+                else:
+                    logger.info(f"bond_china_yield: 最新数据 {max_date}, 请求截止日 {end_date} 数据尚未发布")
+        
         return result, ""
         
     except Exception as e:
         error_msg = f"bond_china_yield 接口调用失败: {type(e).__name__}: {str(e)}"
-        print(f"[WARNING] {error_msg}，将使用默认值 {DEFAULT_RISK_FREE_RATE}")
+        logger.warning(f"{error_msg}，将使用默认值 {DEFAULT_RISK_FREE_RATE}")
         return pd.DataFrame(), error_msg
 
 def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, str]:
@@ -133,7 +154,7 @@ def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[
     """
     try:
         # 1. 通过 sw_daily 获取行情 + 估值数据
-        print(f"[sw_daily] 请求: ts_code={fund_code}, start={start_date}, end={end_date}")
+        logger.info(f"sw_daily 请求: ts_code={fund_code}, start={start_date}, end={end_date}")
         df = pro.sw_daily(
             ts_code=fund_code,
             start_date=start_date,
@@ -141,9 +162,9 @@ def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[
             fields='ts_code,trade_date,close,pe,pb'
         )
         
-        print(f"[sw_daily] 返回: {len(df)} 行, 列={list(df.columns)}")
+        logger.info(f"sw_daily 返回: {len(df)} 行, 列={list(df.columns)}")
         if not df.empty:
-            print(f"[sw_daily] 前3行:\n{df.head(3)}")
+            logger.debug(f"sw_daily 前3行:\n{df.head(3)}")
 
         if df.empty:
             return pd.DataFrame(), (
@@ -160,18 +181,18 @@ def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[
         else:
             df['risk_free_rate'] = DEFAULT_RISK_FREE_RATE  # 兜底默认值
             if rf_error:
-                print(f"[警告] 无风险利率获取失败，使用默认值 {DEFAULT_RISK_FREE_RATE}: {rf_error}")
+                logger.warning(f"无风险利率获取失败，使用默认值 {DEFAULT_RISK_FREE_RATE}: {rf_error}")
 
         # 3. 数据清洗
         df.rename(columns={'ts_code': 'fund_code', 'close': 'close_price'}, inplace=True)
         df.drop_duplicates(subset=['fund_code', 'trade_date'], inplace=True)
 
-        print(f"[fetch_history_data] 最终数据: {len(df)} 行, 日期范围: {df['trade_date'].min()} ~ {df['trade_date'].max()}")
+        logger.info(f"fetch_history_data: 最终 {len(df)} 行, 日期 {df['trade_date'].min()}~{df['trade_date'].max()}")
         return df, ""
 
     except Exception as e:
         error_msg = f"sw_daily 接口调用失败: {type(e).__name__}: {str(e)}"
-        print(f"[ERROR] {error_msg}")
+        logger.error(error_msg)
         return pd.DataFrame(), error_msg
 
 def sync_all_history(fund_code: str) -> tuple[bool, str]:
@@ -184,21 +205,21 @@ def sync_all_history(fund_code: str) -> tuple[bool, str]:
     start_str = start.strftime('%Y%m%d')
     end_str = end.strftime('%Y%m%d')
     
-    print(f"[sync_all_history] 开始同步 {fund_code}, 日期范围: {start_str} ~ {end_str}")
+    logger.info(f"sync_all_history: 开始同步 {fund_code}, {start_str}~{end_str}")
     
     df, error = fetch_history_data(fund_code, start_str, end_str)
     
     if error:
-        print(f"[sync_all_history] 失败: {error}")
+        logger.error(f"sync_all_history: 失败 - {error}")
         return False, error
     
     if df.empty:
-        print(f"[sync_all_history] 失败: 未获取到任何数据")
+        logger.error(f"sync_all_history: 失败 - 未获取到任何数据")
         return False, f"标的 {fund_code} 未获取到任何数据"
     
     save_daily_data(df)
     msg = f"成功同步 {fund_code} 共 {len(df)} 条历史数据（{df['trade_date'].min()} ~ {df['trade_date'].max()}）"
-    print(f"[sync_all_history] {msg}")
+    logger.info(f"sync_all_history: {msg}")
     
     # 必须休眠防止 Tushare 限流封号
     time.sleep(2)
@@ -217,7 +238,7 @@ def sync_incremental(fund_code: str) -> tuple[bool, str]:
     
     latest_date = get_latest_trade_date(fund_code)
     
-    print(f"[sync_incremental] {fund_code}: 今天={today}({weekday_names[weekday]}), 数据库最新={latest_date}")
+    logger.info(f"sync_incremental: {fund_code} 今天={today}({weekday_names[weekday]}), DB最新={latest_date}")
     
     if latest_date is None:
         return False, (
@@ -240,7 +261,7 @@ def sync_incremental(fund_code: str) -> tuple[bool, str]:
     
     # 从最新日期的下一天开始拉取
     start = (datetime.strptime(latest_date_clean, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
-    print(f"[sync_incremental] {fund_code}: 增量拉取 {start} ~ {today}")
+    logger.info(f"sync_incremental: {fund_code} 增量拉取 {start}~{today}")
     
     df, error = fetch_history_data(fund_code, start, today)
     
@@ -255,7 +276,7 @@ def sync_incremental(fund_code: str) -> tuple[bool, str]:
     
     save_daily_data(df)
     msg = f"增量同步成功，新增 {len(df)} 条数据（{df['trade_date'].min()} ~ {df['trade_date'].max()}）"
-    print(f"[sync_incremental] {msg}")
+    logger.info(f"sync_incremental: {msg}")
     
     # 防限流
     time.sleep(1)
