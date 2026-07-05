@@ -10,6 +10,7 @@ from data_fetcher import sync_all_history, sync_incremental, fetch_industry_clas
 from strategy_engine import generate_fund_report
 from llm_agent import generate_ai_report
 from webhook_sender import send_to_all_webhooks
+from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running
 from datetime import datetime
 
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -102,6 +103,9 @@ st.markdown("""
 
 # 初始化数据库
 init_db()
+
+# 启动定时调度器（仅首次生效）
+start_scheduler()
 
 # 初始化行业分类数据（如果数据库为空则自动拉取）
 if get_industry_count() == 0:
@@ -349,6 +353,33 @@ if funds:
         st.rerun()
 else:
     st.sidebar.info("监控池为空，请先添加基金。")
+
+# --- 侧边栏：定时巡检自动执行 ---
+st.sidebar.divider()
+st.sidebar.header("⏰ 定时巡检")
+
+auto_enabled = get_setting("scheduler_auto_enabled", "true")
+auto_current = auto_enabled == "true"
+auto_toggle = st.sidebar.toggle(
+    "启用定时自动巡检",
+    value=auto_current,
+    help="每个交易日 19:30 自动执行巡检并通过 webhook 推送结果",
+)
+if auto_toggle != auto_current:
+    set_setting("scheduler_auto_enabled", "true" if auto_toggle else "false")
+    if auto_toggle:
+        start_scheduler()
+    else:
+        stop_scheduler()
+    st.rerun()
+
+if is_scheduler_running():
+    next_time = get_next_run_time()
+    if next_time:
+        st.sidebar.caption(f"下一次执行: {next_time}")
+    st.sidebar.caption("调度时段: 工作日 19:30")
+else:
+    st.sidebar.caption("调度器未运行")
 
 # --- 侧边栏：消息推送设置 ---
 st.sidebar.divider()

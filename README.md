@@ -18,6 +18,7 @@
 - 📋 **历史分析页面** — 查看每次巡检记录，回溯当日 PE/PB 数据与 AI 解读
 - 📝 **统一日志系统** — 所有 API 调用、数据库操作自动记录至 `logs/clawindex.log`
 - 📨 **Webhook 消息推送** — 巡检时自动向企业微信/钉钉/飞书 Bot 发送富文本卡片消息
+- ⏰ **定时自动巡检** — 每个交易日 19:30 自动触发完整巡检流水线，交易日历二次确认，跳过节假日
 
 ## 策略规则概览
 
@@ -39,6 +40,7 @@
 | **Akshare** | 中国国债收益率数据 |
 | **OpenAI SDK** | LLM 投顾简报生成 |
 | **SQLite** | 本地持久化存储 |
+| **APScheduler** | 定时任务调度 |
 | **Requests** | Webhook HTTP 消息推送 |
 
 ## 快速开始
@@ -99,6 +101,7 @@ ClawIndex/
 ├── llm_agent.py             # LLM 投顾简报生成
 ├── logger.py                # 统一日志模块
 ├── webhook_sender.py        # Webhook 消息推送模块
+├── scheduler.py             # 定时调度模块（交易日 19:30 自动巡检）
 ├── requirements.txt         # Python 依赖
 ├── quant_system.db          # SQLite 数据库文件（运行时生成）
 └── logs/                    # 运行日志（按天轮转，保留 30 天）
