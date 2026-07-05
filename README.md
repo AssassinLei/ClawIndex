@@ -147,10 +147,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=www-data
-WorkingDirectory=/opt/ClawIndex
-EnvironmentFile=/opt/ClawIndex/.env
-ExecStart=/opt/ClawIndex/.venv/bin/streamlit run app.py --server.port 8501 --server.headless true
+User=admin
+WorkingDirectory=/home/admin/clawindex
+EnvironmentFile=/home/admin/clawindex/.env
+ExecStart=/home/admin/clawindex/.venv/bin/streamlit run app.py --server.port 8501 --server.headless true
 Restart=always
 RestartSec=5
 
