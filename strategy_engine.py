@@ -1,5 +1,5 @@
 import pandas as pd
-from database import get_recent_prices, calculate_percentile, get_connection
+from database import get_recent_prices, calculate_percentile, get_connection, safe_float
 from logger import setup_logger
 
 logger = setup_logger("strategy_engine")
@@ -24,30 +24,34 @@ def calculate_technical_indicators(df_prices: pd.DataFrame) -> dict:
 def generate_fund_report(fund_code: str, category: str) -> dict:
     """主控函数：拉取数据 -> 计算指标 -> 硬编码判定信号"""
     conn = get_connection()
-    # 1. 获取最新一天的基本面数据
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM daily_market_data WHERE fund_code = ? ORDER BY trade_date DESC LIMIT 1", (fund_code,))
-    latest_data = cursor.fetchone()
-    conn.close()
+    try:
+        # 1. 获取最新一天的基本面数据
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM daily_market_data WHERE fund_code = ? ORDER BY trade_date DESC LIMIT 1", (fund_code,))
+        latest_data = cursor.fetchone()
+    finally:
+        conn.close()
     
     if not latest_data:
         logger.warning(f"generate_fund_report: {fund_code} 无行情数据")
         return {"error": f"数据库中未找到 {fund_code} 的行情数据，请检查：1) 标的是否已添加 2) 历史数据是否同步成功 3) 标的代码格式是否正确（如 000300.SH）"}
         
     latest_data = dict(latest_data)
-    pe = latest_data['pe']
-    pb = latest_data['pb']
-    risk_free = latest_data['risk_free_rate']
+    # pe/pb/risk_free_rate 在此统一转 float（兼容历史 TEXT 数据）
+    # close_price 在 get_recent_prices 中通过 pd.to_numeric 统一转数值
+    pe = safe_float(latest_data['pe'])
+    pb = safe_float(latest_data['pb'])
+    risk_free = safe_float(latest_data['risk_free_rate'])
     
     # 2. 计算基本面的推导指标和历史分位
-    pe_percentile = calculate_percentile(fund_code, 'pe', pe) if pe else None
-    pb_percentile = calculate_percentile(fund_code, 'pb', pb) if pb else None
+    pe_percentile = calculate_percentile(fund_code, 'pe', pe) if pe is not None else None
+    pb_percentile = calculate_percentile(fund_code, 'pb', pb) if pb is not None else None
     
     # 推导风险溢价 (Fed模型: 1/PE - 无风险利率)
-    risk_premium = (1 / pe - risk_free) if pe and pe > 0 and risk_free is not None else None
+    risk_premium = (1 / pe - risk_free) if pe is not None and pe > 0 and risk_free is not None else None
     
     # 推导 ROE = PB / PE (需避免除零)
-    roe = (pb / pe) if pe and pe > 0 and pb else None
+    roe = (pb / pe) if pe is not None and pe > 0 and pb is not None else None
 
     # 3. 计算技术面指标
     df_prices = get_recent_prices(fund_code, days=150)
@@ -97,7 +101,7 @@ def _apply_hard_rules(category: str, inds: dict) -> dict:
         # 宽基指数逻辑
         if pe_pct is not None:
             if pe_pct < 0.20:
-                if price and ma60 and price > ma60:
+                if price is not None and ma60 is not None and price > ma60:
                     action = "STRONG_BUY"
                     logic_details.append("极度低估 (PE分位<20%) 且 价格突破60日趋势线，触发强烈加仓。")
                 else:
@@ -117,7 +121,7 @@ def _apply_hard_rules(category: str, inds: dict) -> dict:
                 
     elif category == 'tech_growth':
         # 科技成长逻辑（强调用趋势过滤，防止左侧接飞刀）
-        if pe_pct is not None and price and ma120:
+        if pe_pct is not None and price is not None and ma120 is not None:
             if pe_pct < 0.30 and price > ma120:
                 action = "STRONG_BUY"
                 logic_details.append("估值便宜 (PE分位<30%) 且站上120日牛熊线，右侧信号确立，执行买入。")
@@ -132,8 +136,8 @@ def _apply_hard_rules(category: str, inds: dict) -> dict:
         else:
             missing = []
             if pe_pct is None: missing.append("PE分位数")
-            if not price: missing.append("当前价格")
-            if not ma120: missing.append("MA120")
+            if price is None: missing.append("当前价格")
+            if ma120 is None: missing.append("MA120")
             logic_details.append(f"指标缺失({','.join(missing)})，无法判定信号，维持持有。")
 
     elif category == 'cycle_mfg':
@@ -153,18 +157,18 @@ def _apply_hard_rules(category: str, inds: dict) -> dict:
     elif category == 'dividend':
         # 红利稳健逻辑
         pe_val = inds.get("pe")
-        if pb_pct is not None and pe_val:
+        if pb_pct is not None and pe_val is not None:
              if pb_pct < 0.50 and pe_val < 15:
                  action = "BUY_PLAN"
                  logic_details.append("估值合理，提供充分安全垫，适合稳健吃息买入。")
-             elif price and ma120 and price < ma120:
+             elif price is not None and ma120 is not None and price < ma120:
                  logic_details.append("趋势向下，仅定投不单笔大额加仓。")
              else:
                  logic_details.append(f"PB分位{pb_pct*100:.1f}%，PE={pe_val:.1f}，不满足买入条件，持有观望。")
         else:
             missing = []
             if pb_pct is None: missing.append("PB分位数")
-            if not pe_val: missing.append("PE")
+            if pe_val is None: missing.append("PE")
             logic_details.append(f"指标缺失({','.join(missing)})，无法判定信号，维持持有。")
 
     return {

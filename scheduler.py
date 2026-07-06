@@ -39,42 +39,51 @@ def run_scheduled_inspection():
 
         total = len(funds)
         success_count = 0
-        error_count = 0
+        sync_error_count = 0
+        pipeline_error_count = 0
 
         for fund in funds:
             code = fund["fund_code"]
             name = fund["fund_name"]
             cat = fund["category"]
-            logger.info(f"定时巡检: [{success_count + error_count + 1}/{total}] {name} ({code})")
+            logger.info(f"定时巡检: [{success_count + sync_error_count + pipeline_error_count + 1}/{total}] {name} ({code})")
 
-            # 1. 增量同步
-            sync_success, sync_msg = sync_incremental(code)
-            if not sync_success:
-                logger.warning(f"定时巡检: {name} 同步失败 - {sync_msg}")
-                error_count += 1
+            try:
+                # 1. 增量同步
+                sync_success, sync_msg = sync_incremental(code)
+                if not sync_success:
+                    logger.warning(f"定时巡检: {name} 同步失败 - {sync_msg}")
+                    sync_error_count += 1
+                    continue
+
+                # 2. 策略引擎
+                fund_data = generate_fund_report(code, cat)
+                fund_data["fund_name"] = name
+
+                # 3. AI 报告
+                ai_report = generate_ai_report(fund_data)
+
+                # 4. 保存结果
+                has_error = "error" in fund_data
+                action = fund_data.get("decision", {}).get("action", "ERROR")
+                save_inspection_result(code, name, action if not has_error else "ERROR", ai_report)
+
+                # 5. Webhook 推送
+                wh_urls = get_webhook_urls()
+                if wh_urls:
+                    send_to_all_webhooks(wh_urls, fund_data, ai_report)
+
+                success_count += 1
+
+            except Exception as e:
+                logger.error(f"定时巡检: {name} ({code}) 处理异常: {e}，其他标的将继续巡检", exc_info=True)
+                pipeline_error_count += 1
                 continue
 
-            # 2. 策略引擎
-            fund_data = generate_fund_report(code, cat)
-            fund_data["fund_name"] = name
-
-            # 3. AI 报告
-            ai_report = generate_ai_report(fund_data)
-
-            # 4. 保存结果
-            has_error = "error" in fund_data
-            action = fund_data.get("decision", {}).get("action", "ERROR")
-            save_inspection_result(code, name, action if not has_error else "ERROR", ai_report)
-
-            # 5. Webhook 推送
-            wh_urls = get_webhook_urls()
-            if wh_urls:
-                send_to_all_webhooks(wh_urls, fund_data, ai_report)
-
-            success_count += 1
-
+        error_count = sync_error_count + pipeline_error_count
         logger.info(
             f"=== 定时巡检结束 === 成功 {success_count}, 失败/跳过 {error_count}"
+            f" (同步失败 {sync_error_count}, 流水线异常 {pipeline_error_count})"
         )
 
 
