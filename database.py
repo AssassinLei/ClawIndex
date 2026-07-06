@@ -217,6 +217,8 @@ def get_recent_prices(fund_code: str, days: int = 150) -> pd.DataFrame:
         conn.close()
     # 确保 close_price 为数值类型（兼容历史 TEXT 数据）
     df['close_price'] = pd.to_numeric(df['close_price'], errors='coerce')
+    # 确保 trade_date 为字符串类型，避免 pandas 混合类型导致 sort_values 报错
+    df['trade_date'] = df['trade_date'].astype(str)
     # 返回正序排序的数据，方便计算指标
     return df.sort_values(by='trade_date').reset_index(drop=True)
 
