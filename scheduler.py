@@ -13,7 +13,7 @@ from logger import setup_logger
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from database import get_all_funds, save_inspection_result, get_webhook_urls
+from database import get_all_funds, save_inspection_result, get_webhook_urls, get_setting
 from data_fetcher import sync_incremental, is_trade_day
 from strategy_engine import generate_fund_report
 from llm_agent import generate_ai_report
@@ -63,15 +63,26 @@ def run_scheduled_inspection():
                 # 3. AI 报告
                 ai_report = generate_ai_report(fund_data)
 
-                # 4. 保存结果
+                # 4. 保存结果（含计算指标）
                 has_error = "error" in fund_data
                 action = fund_data.get("decision", {}).get("action", "ERROR")
-                save_inspection_result(code, name, action if not has_error else "ERROR", ai_report)
+                inds = fund_data.get("indicators", {})
+                save_inspection_result(
+                    code, name,
+                    action if not has_error else "ERROR",
+                    ai_report,
+                    pe_percentile=inds.get("pe_percentile"),
+                    pb_percentile=inds.get("pb_percentile"),
+                    ma60=inds.get("ma60"),
+                    ma120=inds.get("ma120"),
+                )
 
-                # 5. Webhook 推送
-                wh_urls = get_webhook_urls()
-                if wh_urls:
-                    send_to_all_webhooks(wh_urls, fund_data, ai_report)
+                # 5. Webhook 推送（尊重用户开关设置）
+                webhook_enabled = get_setting("webhook_inspection_enabled", "false")
+                if webhook_enabled == "true":
+                    wh_urls = get_webhook_urls()
+                    if wh_urls:
+                        send_to_all_webhooks(wh_urls, fund_data, ai_report)
 
                 success_count += 1
 

@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, save_inspection_result, get_inspection_history, get_market_data_for_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting
+from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, save_inspection_result, get_inspection_history, get_market_data_for_date, get_latest_market_data, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, is_trade_day
 from strategy_engine import generate_fund_report
 from llm_agent import generate_ai_report
@@ -539,8 +539,17 @@ with tab1:
             else:
                 style = ACTION_STYLES.get(action, ACTION_STYLES["HOLD"])
 
-            # 5. 保存结果
-            save_inspection_result(code, name, action if not has_error else "ERROR", ai_report)
+            # 5. 保存结果（含计算指标）
+            inds = fund_data.get('indicators', {})
+            save_inspection_result(
+                code, name,
+                action if not has_error else "ERROR",
+                ai_report,
+                pe_percentile=inds.get('pe_percentile'),
+                pb_percentile=inds.get('pb_percentile'),
+                ma60=inds.get('ma60'),
+                ma120=inds.get('ma120'),
+            )
 
             # 6. Webhook 推送
             if new_enabled:
@@ -677,10 +686,17 @@ with tab2:
                 
                 # 展开详情
                 with st.expander(f"查看详情 - {record['fund_name']} ({record['inspect_date']})", expanded=True):
-                    # 尝试获取当日行情数据
+                    # 展示行情数据（来自 daily_market_data，优先匹配巡检日期，失败回退到最新可用数据）
                     market_data = get_market_data_for_date(record['fund_code'], record['inspect_date'])
+                    fallback_used = False
+                    if not market_data:
+                        market_data = get_latest_market_data(record['fund_code'])
+                        fallback_used = True
                     
                     if market_data:
+                        if fallback_used:
+                            actual_date = market_data.get('trade_date', '?')
+                            st.caption(f"⚠️ 巡检日期 ({record['inspect_date']}) 无行情数据，展示最新可用数据 (交易日: {actual_date})")
                         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                         col_m1.metric("收盘价", f"{market_data.get('close_price', 'N/A')}")
                         col_m2.metric("PE", f"{market_data.get('pe', 'N/A')}")
@@ -691,7 +707,27 @@ with tab2:
                         if not is_open:
                             st.caption("当日为非交易日（周末或节假日），无行情数据")
                         else:
-                            st.caption("当日行情数据暂不可用（可能尚未入库）")
+                            st.caption("该指数暂无任何行情数据（可能尚未同步）")
+
+                    # 展示计算指标（来自 inspection_log，巡检时实时计算并入库）
+                    st.markdown("**📐 计算指标**")
+                    pe_pct = record.get('pe_percentile')
+                    pb_pct = record.get('pb_percentile')
+                    ma60 = record.get('ma60')
+                    ma120 = record.get('ma120')
+                    has_calc = any(v is not None for v in [pe_pct, pb_pct, ma60, ma120])
+                    if has_calc:
+                        col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                        pe_pct_str = f"{pe_pct * 100:.1f}%" if pe_pct is not None else "N/A"
+                        pb_pct_str = f"{pb_pct * 100:.1f}%" if pb_pct is not None else "N/A"
+                        ma60_str = f"{ma60:.3f}" if ma60 is not None else "N/A"
+                        ma120_str = f"{ma120:.3f}" if ma120 is not None else "N/A"
+                        col_c1.metric("PE 历史分位", pe_pct_str)
+                        col_c2.metric("PB 历史分位", pb_pct_str)
+                        col_c3.metric("60日均线", ma60_str)
+                        col_c4.metric("120日均线", ma120_str)
+                    else:
+                        st.caption("该记录为旧版数据，无计算指标（请重新巡检以生成）")
                     
                     # AI 报告
                     st.markdown("**AI 投顾解读**")

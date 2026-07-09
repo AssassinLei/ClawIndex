@@ -27,6 +27,21 @@ def safe_float(val):
         return None
 
 
+def _norm_date(date_str: str) -> str:
+    """将 YYYYMMDD 或 YYYY-MM-DD 统一规范化为 YYYY-MM-DD，异常输入返回原值"""
+    if not date_str:
+        return date_str
+    s = str(date_str).strip()
+    # 已是 YYYY-MM-DD
+    if len(s) == 10 and s[4] == '-' and s[7] == '-':
+        return s
+    # YYYYMMDD → YYYY-MM-DD
+    clean = s.replace('-', '').replace('/', '')
+    if len(clean) == 8 and clean.isdigit():
+        return f"{clean[:4]}-{clean[4:6]}-{clean[6:8]}"
+    return s
+
+
 def get_connection():
     # 确保返回的行是字典格式，方便读取字段
     conn = sqlite3.connect(DB_NAME)
@@ -96,6 +111,18 @@ def init_db():
             cursor.execute("ALTER TABLE inspection_log ADD COLUMN ai_report TEXT")
         except sqlite3.OperationalError:
             pass  # 列已存在，忽略
+
+        # 兼容旧表：新增四种计算指标列
+        for col_info in [
+            ("pe_percentile", "REAL"),
+            ("pb_percentile", "REAL"),
+            ("ma60", "REAL"),
+            ("ma120", "REAL"),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE inspection_log ADD COLUMN {col_info[0]} {col_info[1]}")
+            except sqlite3.OperationalError:
+                pass  # 列已存在，忽略
         
         # 表5：Webhook 地址配置
         cursor.execute('''
@@ -169,7 +196,7 @@ def save_daily_data(df: pd.DataFrame):
         for _, row in df.iterrows():
             rows.append((
                 row.get('fund_code'),
-                str(row.get('trade_date')),
+                _norm_date(str(row.get('trade_date', ''))),
                 safe_float(row.get('close_price')),
                 safe_float(row.get('pe')),
                 safe_float(row.get('pb')),
@@ -193,8 +220,9 @@ def get_latest_trade_date(fund_code: str) -> str:
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        # 使用 REPLACE 去横线再取 MAX，兼容 YYYYMMDD / YYYY-MM-DD 两种格式
         cursor.execute(
-            "SELECT MAX(trade_date) FROM daily_market_data WHERE fund_code = ?",
+            "SELECT MAX(REPLACE(trade_date, '-', '')) FROM daily_market_data WHERE fund_code = ?",
             (fund_code,)
         )
         result = cursor.fetchone()[0]
@@ -206,19 +234,20 @@ def get_recent_prices(fund_code: str, days: int = 150) -> pd.DataFrame:
     """获取最近N天的价格，用于计算移动平均线(SMA)等技术指标"""
     conn = get_connection()
     try:
+        # 使用 REPLACE 去横线后排序，兼容 YYYYMMDD / YYYY-MM-DD 两种格式
         query = """
             SELECT trade_date, close_price 
             FROM daily_market_data 
             WHERE fund_code = ? 
-            ORDER BY trade_date DESC LIMIT ?
+            ORDER BY REPLACE(trade_date, '-', '') DESC LIMIT ?
         """
         df = pd.read_sql_query(query, conn, params=(fund_code, days))
     finally:
         conn.close()
     # 确保 close_price 为数值类型（兼容历史 TEXT 数据）
     df['close_price'] = pd.to_numeric(df['close_price'], errors='coerce')
-    # 确保 trade_date 为字符串类型，避免 pandas 混合类型导致 sort_values 报错
-    df['trade_date'] = df['trade_date'].astype(str)
+    # 统一日期格式再排序，避免字典序陷阱
+    df['trade_date'] = df['trade_date'].astype(str).apply(_norm_date)
     # 返回正序排序的数据，方便计算指标
     return df.sort_values(by='trade_date').reset_index(drop=True)
 
@@ -229,18 +258,27 @@ def calculate_percentile(fund_code: str, indicator: str, current_value: float, l
     """
     if current_value is None or indicator not in ['pe', 'pb']:
         return None
-        
+                
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        
+                
         # 1. 检查历史总条数（限定在 lookback_days 窗口内，与分位计算保持一致）
         cursor.execute(f"SELECT COUNT(*) FROM (SELECT {indicator} FROM daily_market_data WHERE fund_code = ? AND {indicator} IS NOT NULL ORDER BY trade_date DESC LIMIT ?)", (fund_code, lookback_days))
         total_count = cursor.fetchone()[0]
-        
+                
+        logger.info(
+            "[%s] %s 分位计算：请求窗口 %d 天，实际可用数据 %d 条",
+            fund_code, indicator.upper(), lookback_days, total_count
+        )
+    
         if total_count < 100:
+            logger.warning(
+                "[%s] %s 分位计算数据不足（实际 %d 条 < 100），跳过",
+                fund_code, indicator.upper(), total_count
+            )
             return None # 数据不足，不计算分位
-            
+                    
         # 2. 计算有多少天的数值低于当前数值
         cursor.execute(f"""
             SELECT COUNT(*) FROM (
@@ -249,9 +287,9 @@ def calculate_percentile(fund_code: str, indicator: str, current_value: float, l
                 ORDER BY trade_date DESC LIMIT ?
             ) WHERE {indicator} < ?
         """, (fund_code, lookback_days, current_value))
-        
+                
         lower_count = cursor.fetchone()[0]
-        
+                
         # 计算百分比并保留四位小数 (例如 0.1542 代表 15.42%)
         return round(lower_count / total_count, 4)
     finally:
@@ -308,17 +346,25 @@ def get_industry_count() -> int:
     finally:
         conn.close()
 
-def save_inspection_result(fund_code: str, fund_name: str, action: str, ai_report: str = ""):
-    """保存巡检结果（同一标的同一天覆盖更新）"""
+def save_inspection_result(fund_code: str, fund_name: str, action: str, ai_report: str = "",
+                           pe_percentile: float = None, pb_percentile: float = None,
+                           ma60: float = None, ma120: float = None):
+    """保存巡检结果（同一标的同一天覆盖更新），含四种计算指标"""
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO inspection_log (fund_code, fund_name, action, ai_report, inspect_date)
-            VALUES (?, ?, ?, ?, date('now', 'localtime'))
-        """, (fund_code, fund_name, action, ai_report))
+            INSERT OR REPLACE INTO inspection_log
+                (fund_code, fund_name, action, ai_report, inspect_date,
+                 pe_percentile, pb_percentile, ma60, ma120)
+            VALUES (?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?)
+        """, (fund_code, fund_name, action, ai_report,
+              pe_percentile, pb_percentile, ma60, ma120))
         conn.commit()
-        logger.info(f"save_inspection_result: {fund_code} {fund_name} action={action}")
+        logger.info(
+            f"save_inspection_result: {fund_code} {fund_name} action={action} "
+            f"PE%={pe_percentile} PB%={pb_percentile} MA60={ma60} MA120={ma120}"
+        )
     finally:
         conn.close()
 
@@ -353,14 +399,17 @@ def get_inspection_history(fund_code: str = None, action: str = None,
         conn.close()
 
 def get_market_data_for_date(fund_code: str, trade_date: str) -> Dict:
-    """查询指定标的在某日的行情数据（close_price, pe, pb, risk_free_rate）"""
+    """查询指定标的在某日的行情数据（close_price, pe, pb, risk_free_rate）。
+    兼容数据库中 YYYYMMDD 和 YYYY-MM-DD 两种格式。"""
     conn = get_connection()
     try:
+        normalized = _norm_date(trade_date)
+        # 先用规范化格式查询
         cursor = conn.execute("""
             SELECT close_price, pe, pb, risk_free_rate
             FROM daily_market_data
-            WHERE fund_code = ? AND trade_date = ?
-        """, (fund_code, trade_date))
+            WHERE fund_code = ? AND REPLACE(trade_date, '-', '') = REPLACE(?, '-', '')
+        """, (fund_code, normalized))
         row = cursor.fetchone()
         if not row:
             return {}
@@ -370,6 +419,30 @@ def get_market_data_for_date(fund_code: str, trade_date: str) -> Dict:
             "pe": safe_float(row["pe"]),
             "pb": safe_float(row["pb"]),
             "risk_free_rate": safe_float(row["risk_free_rate"]),
+        }
+    finally:
+        conn.close()
+
+
+def get_latest_market_data(fund_code: str) -> Dict:
+    """查询指定指数的最新行情数据（不限日期），作为 get_market_data_for_date 的回退"""
+    conn = get_connection()
+    try:
+        cursor = conn.execute("""
+            SELECT close_price, pe, pb, risk_free_rate, trade_date
+            FROM daily_market_data
+            WHERE fund_code = ?
+            ORDER BY trade_date DESC LIMIT 1
+        """, (fund_code,))
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        return {
+            "close_price": safe_float(row["close_price"]),
+            "pe": safe_float(row["pe"]),
+            "pb": safe_float(row["pb"]),
+            "risk_free_rate": safe_float(row["risk_free_rate"]),
+            "trade_date": _norm_date(row["trade_date"]),
         }
     finally:
         conn.close()
