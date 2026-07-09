@@ -434,6 +434,7 @@ if webhook_urls:
 else:
     st.sidebar.caption("暂无 Webhook 地址，请添加")
 
+st.sidebar.caption("当前版本 V0.23")
 
 # --- 主页面：巡检核心工作流 ---
 logo_svg = LOGO_PATH.read_text(encoding="utf-8")
