@@ -8,25 +8,16 @@ import json
 from typing import Dict, List
 from datetime import datetime
 from logger import setup_logger
+from constants import CATEGORY_NAMES
 
 logger = setup_logger("webhook_sender")
 
 # 操作建议视觉映射
 ACTION_LABELS = {
-    "STRONG_BUY": "🟢 强烈加仓",
-    "BUY_PLAN":   "🟩 定投买入",
-    "HOLD":       "🟡 持有观望",
-    "SELL_PLAN":  "🔴 止盈卖出",
-    "ERROR":      "⚠️ 数据异常",
-}
-
-
-# 分类中文映射
-CATEGORY_NAMES = {
-    "wide_base": "宽基指数",
-    "tech_growth": "科技成长",
-    "cycle_mfg": "周期制造",
-    "dividend": "稳健收息",
+    "买入":      "🟢 建议买入",
+    "卖出":      "🔴 建议卖出",
+    "持有/观望":  "🟡 持有观望",
+    "数据异常":   "⚠️ 数据异常",
 }
 
 
@@ -51,11 +42,11 @@ def build_feishu_post(fund_data: Dict) -> tuple:
     cat_name = CATEGORY_NAMES.get(cat, cat)
     inds = fund_data.get("indicators", {})
     decision = fund_data.get("decision", {})
-    action = decision.get("action", "HOLD")
+    action = decision.get("action", "持有/观望")
     details = decision.get("details", [])
     has_error = "error" in fund_data
 
-    action_label = ACTION_LABELS.get(action, ACTION_LABELS["HOLD"])
+    action_label = ACTION_LABELS.get(action, ACTION_LABELS["持有/观望"])
     today = datetime.now().strftime("%Y-%m-%d")
 
     title = f"📊 巡检 | {code} {name} · {cat_name}"
@@ -95,10 +86,10 @@ def build_feishu_post(fund_data: Dict) -> tuple:
         )},
     ])
 
-    # 段落 3：韬略
+    # 段落 3：AI 分析
     details_text = "\n".join(f"  • {d}" for d in details) if details else "  • 无（数据异常）"
     content.append([
-        {"tag": "text", "text": f"\n━━━ 💡 韬略 ━━━\n{details_text}"},
+        {"tag": "text", "text": f"\n━━━ 💡 AI 分析 ━━━\n{details_text}"},
     ])
 
     # 尾部
@@ -109,7 +100,7 @@ def build_feishu_post(fund_data: Dict) -> tuple:
     return title, content
 
 
-def send_inspection_card(webhook_url: str, fund_data: Dict, ai_report: str, label: str = "") -> bool:
+def send_inspection_card(webhook_url: str, fund_data: Dict, label: str = "") -> bool:
     """
     向指定 webhook 地址发送巡检卡片消息。
     返回 True 表示发送成功，False 表示失败。
@@ -197,7 +188,6 @@ def send_inspection_card(webhook_url: str, fund_data: Dict, ai_report: str, labe
 def send_to_all_webhooks(
     webhook_urls: List[Dict],
     fund_data: Dict,
-    ai_report: str,
 ) -> Dict[str, int]:
     """
     向所有配置的 webhook 地址发送巡检卡片。
@@ -211,7 +201,7 @@ def send_to_all_webhooks(
         wh_label = wh.get("label", "")
         if not url:
             continue
-        if send_inspection_card(url, fund_data, ai_report, label=wh_label):
+        if send_inspection_card(url, fund_data, label=wh_label):
             success_count += 1
         else:
             fail_count += 1

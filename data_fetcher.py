@@ -10,11 +10,19 @@ from logger import setup_logger
 logger = setup_logger("data_fetcher")
 
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
-if not TUSHARE_TOKEN:
-    raise RuntimeError("未设置 TUSHARE_TOKEN 环境变量，请检查 .env 文件")
 
-ts.set_token(TUSHARE_TOKEN)
-pro = ts.pro_api()
+_pro = None
+
+def _get_pro():
+    """延迟初始化 tushare pro_api，避免 import 阶段因缺少 TUSHARE_TOKEN 崩溃"""
+    global _pro
+    if _pro is None:
+        token = os.environ.get("TUSHARE_TOKEN", "")
+        if not token:
+            raise RuntimeError("未设置 TUSHARE_TOKEN 环境变量，请检查 .env 文件")
+        ts.set_token(token)
+        _pro = ts.pro_api()
+    return _pro
 
 # 交易日历缓存（避免重复查询）
 _trade_cal_cache = {}
@@ -33,7 +41,7 @@ def is_trade_day(date_str: str) -> tuple[bool, str]:
         return _trade_cal_cache[clean_date]
     
     try:
-        df = pro.trade_cal(exchange='SSE', start_date=clean_date, end_date=clean_date)
+        df = _get_pro().trade_cal(exchange='SSE', start_date=clean_date, end_date=clean_date)
         if df.empty:
             # 接口返回空，回退到周末判断
             dt = datetime.strptime(clean_date, '%Y%m%d')
@@ -67,7 +75,7 @@ def fetch_industry_classify() -> tuple[bool, str]:
     for level in ['L1', 'L2', 'L3']:
         try:
             logger.info(f"index_classify {level}: 拉取...")
-            df = pro.index_classify(level=level, src='SW2021')
+            df = _get_pro().index_classify(level=level, src='SW2021')
             logger.info(f"index_classify {level}: 返回 {len(df)} 行")
             if not df.empty:
                 logger.debug(f"index_classify {level} 前3行:\n{df.head(3)}")
@@ -160,18 +168,18 @@ def fetch_risk_free_rate(start_date: str, end_date: str) -> tuple[pd.DataFrame, 
 def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, str]:
     """
     获取指定区间的历史日线数据（含行情与估值）。
-    - sw_daily：一次性获取 close、pe、pb
+    - sw_daily：一次性获取全部行情字段（open、high、low、close、change、pct_change、vol、amount、pe、pb、float_mv、total_mv）
     - akshare：获取中国10年期国债收益率作为无风险利率
     返回: (DataFrame, error_message)
     """
     try:
         # 1. 通过 sw_daily 获取行情 + 估值数据
         logger.info(f"sw_daily 请求: ts_code={fund_code}, start={start_date}, end={end_date}")
-        df = pro.sw_daily(
+        df = _get_pro().sw_daily(
             ts_code=fund_code,
             start_date=start_date,
             end_date=end_date,
-            fields='ts_code,trade_date,close,pe,pb'
+            fields='ts_code,trade_date,name,open,high,low,close,change,pct_change,vol,amount,pe,pb,float_mv,total_mv'
         )
         
         logger.info(f"sw_daily 返回: {len(df)} 行, 列={list(df.columns)}")
@@ -196,7 +204,14 @@ def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[
                 logger.warning(f"无风险利率获取失败，使用默认值 {DEFAULT_RISK_FREE_RATE}: {rf_error}")
 
         # 3. 数据清洗
-        df.rename(columns={'ts_code': 'fund_code', 'close': 'close_price'}, inplace=True)
+        df.rename(columns={
+            'ts_code': 'fund_code',
+            'close': 'close_price',
+            'open': 'open_price',
+            'high': 'high_price',
+            'low': 'low_price',
+            'vol': 'volume',
+        }, inplace=True)
         df.drop_duplicates(subset=['fund_code', 'trade_date'], inplace=True)
 
         logger.info(f"fetch_history_data: 最终 {len(df)} 行, 日期 {df['trade_date'].min()}~{df['trade_date'].max()}")

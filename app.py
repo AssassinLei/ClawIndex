@@ -5,12 +5,13 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, save_inspection_result, get_inspection_history, get_market_data_for_date, get_latest_market_data, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting
+from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, get_inspection_history, get_market_data_for_date, get_latest_market_data, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, is_trade_day
-from strategy_engine import generate_fund_report
-from llm_agent import generate_ai_report
+from llm_agent import INDICATOR_META, INDICATOR_GROUPS
 from webhook_sender import send_to_all_webhooks
 from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running
+from constants import CATEGORY_NAMES
+from inspection_pipeline import run_single_inspection
 from datetime import datetime
 
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -104,8 +105,10 @@ st.markdown("""
 # 初始化数据库
 init_db()
 
-# 启动定时调度器（仅首次生效）
-start_scheduler()
+# 根据配置决定是否启动定时调度器（关闭后不会因为 rerun 自动重启）
+auto_enabled_init = get_setting("scheduler_auto_enabled", "true")
+if auto_enabled_init == "true":
+    start_scheduler()
 
 # 初始化行业分类数据（如果数据库为空则自动拉取）
 if get_industry_count() == 0:
@@ -131,11 +134,10 @@ for ind in industries:
 
 # 操作建议视觉风格映射（巡检页与历史页复用）
 ACTION_STYLES = {
-    "STRONG_BUY": {"color": "#16a34a", "bg": "#f0fdf4", "border": "#22c55e", "icon": "🟢", "label": "强烈加仓"},
-    "BUY_PLAN":   {"color": "#15803d", "bg": "#f0fdf4", "border": "#4ade80", "icon": "🟩", "label": "定投买入"},
-    "HOLD":       {"color": "#d97706", "bg": "#fffbeb", "border": "#f59e0b", "icon": "🟡", "label": "持有观望"},
-    "SELL_PLAN":  {"color": "#dc2626", "bg": "#fef2f2", "border": "#ef4444", "icon": "🔴", "label": "止盈卖出"},
-    "ERROR":      {"color": "#6b7280", "bg": "#f9fafb", "border": "#9ca3af", "icon": "⚠️", "label": "数据异常"},
+    "买入":      {"color": "#16a34a", "bg": "#f0fdf4", "border": "#22c55e", "icon": "🟢", "label": "建议买入"},
+    "卖出":      {"color": "#dc2626", "bg": "#fef2f2", "border": "#ef4444", "icon": "🔴", "label": "建议卖出"},
+    "持有/观望":  {"color": "#d97706", "bg": "#fffbeb", "border": "#f59e0b", "icon": "🟡", "label": "持有观望"},
+    "数据异常":   {"color": "#6b7280", "bg": "#f9fafb", "border": "#9ca3af", "icon": "⚠️", "label": "数据异常"},
 }
 
 # --- 巡检卡片渲染辅助函数 ---
@@ -165,31 +167,73 @@ def render_card_expander(card: dict, expanded: bool = False):
         if card.get('has_error'):
             st.error(f"⚠️ {card.get('error_msg', '未知错误')}")
         else:
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                st.subheader(card['name'], anchor=False)
+            col_left, col_right = st.columns([1, 1.5])
+
+            # ===== 左列：纯指标数据 =====
+            with col_left:
+                st.subheader("📊 指标数据", anchor=False)
                 inds = card.get('indicators', {})
-                st.metric(label="当前价格", value=round(inds.get('price', 0), 3) if inds.get('price') else "N/A")
-                st.metric(label="当前市盈率 (PE)", value=round(inds.get('pe', 0), 2) if inds.get('pe') else "N/A")
-                st.metric(label="历史PE分位数", value=f"{round(inds.get('pe_percentile', 0)*100, 2)}%" if inds.get('pe_percentile') else "N/A")
-                st.subheader("韬略", anchor=False)
-                details = card.get('details', [])
-                if details:
-                    for detail in details:
-                        st.markdown(f"<div style='color:#1a1a1a; font-weight:500; font-size:0.92rem; margin:4px 0;'>- {detail}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div style='color:#1a1a1a; font-weight:500; font-size:0.92rem;'>- 无（数据异常）</div>", unsafe_allow_html=True)
-            with col2:
-                st.subheader("AI 投顾解读", anchor=False)
-                ai_text = card.get('ai_report', '')
-                if ai_text:
-                    clean_r = re.sub(r'^#{1,6}\s+(.+)$', r'**\1**', ai_text, flags=re.MULTILINE)
-                    if card.get('has_error'):
-                        st.warning(clean_r)
-                    else:
-                        st.info(clean_r)
+
+                def _fmt(v, fmt_spec="{:.2f}", post=""):
+                    if v is None:
+                        return "N/A"
+                    try:
+                        return f"{fmt_spec.format(v)}{post}"
+                    except (ValueError, TypeError):
+                        return str(v)
+
+                # 用嵌套 2 列紧凑排列
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("当前价格",  _fmt(inds.get("price"), "{:.3f}"))
+                    st.metric("市盈率 (PE)", _fmt(inds.get("pe")))
+                    st.metric("PE 历史分位", f"{inds['pe_percentile'] * 100:.1f}%" if inds.get("pe_percentile") is not None else "N/A")
+                    st.metric("市净率 (PB)", _fmt(inds.get("pb")))
+                    st.metric("ROE",         f"{inds['roe'] * 100:.2f}%" if inds.get("roe") is not None else "N/A")
+                with c2:
+                    st.metric("PB 历史分位", f"{inds['pb_percentile'] * 100:.1f}%" if inds.get("pb_percentile") is not None else "N/A")
+                    st.metric("风险溢价",    _fmt(inds.get("risk_premium"), "{:.4f}"))
+                    st.metric("60日均线",    _fmt(inds.get("ma60"), "{:.3f}"))
+                    st.metric("120日均线",   _fmt(inds.get("ma120"), "{:.3f}"))
+
+            # ===== 右列：操作建议 → 分析 → 置信度 =====
+            with col_right:
+                ai_data = card.get('ai_report', {})
+                advice = ai_data.get('advice', '持有/观望') if isinstance(ai_data, dict) else '持有/观望'
+                confidence_val = card.get('confidence', 0)
+                analysis_text = ai_data.get('analysis', '') if isinstance(ai_data, dict) else str(ai_data) if ai_data else ''
+
+                # 操作建议
+                st.subheader("🎯 操作建议", anchor=False)
+                style = ACTION_STYLES.get(advice, ACTION_STYLES["持有/观望"])
+                st.markdown(f"""
+                <div style="
+                    display:inline-block;
+                    padding:6px 20px;
+                    border-radius:20px;
+                    font-size:1.1rem;
+                    font-weight:700;
+                    color:{style['color']};
+                    background:{style['bg']};
+                    border:1.5px solid {style['border']};
+                    margin-bottom:12px;
+                ">{style['icon']} {style['label']}</div>
+                """, unsafe_allow_html=True)
+
+                # AI 分析
+                st.subheader("📝 AI 分析", anchor=False)
+                if analysis_text:
+                    clean = re.sub(r'^#{1,6}\s+(.+)$', r'**\1**', analysis_text, flags=re.MULTILINE)
+                    st.info(clean)
                 else:
                     st.caption("- 无 AI 报告")
+
+                # 置信度（小字，不占主视觉）
+                st.html("<h5 style='color:#6b7280; margin:16px 0 4px 0;'>置信度</h5>")
+                if confidence_val is not None:
+                    st.progress(confidence_val / 100.0, text=f"{confidence_val}%")
+                else:
+                    st.caption("N/A")
 
 # --- 侧边栏：巡检进行中提示 ---
 if st.session_state.get("inspection_active", False):
@@ -327,14 +371,6 @@ st.sidebar.divider()
 st.sidebar.subheader("当前监控列表")
 funds = get_all_funds()
 
-# 分类中文映射
-CATEGORY_NAMES = {
-    "wide_base": "宽基指数",
-    "tech_growth": "科技成长",
-    "cycle_mfg": "周期制造",
-    "dividend": "稳健收息"
-}
-
 if funds:
     df_funds = pd.DataFrame(funds)
     # 转换为中文表头和分类名称
@@ -450,7 +486,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 st.markdown("策略不动摇，AI助决断。")
 
-tab1, tab2 = st.tabs(["研判", "历史分析"])
+tab1, tab2, tab3 = st.tabs(["研判", "历史分析", "提示词配置"])
 
 with tab1:
     # --- 巡检按钮（仅非活跃状态显示）---
@@ -515,50 +551,26 @@ with tab1:
             processed_codes.add(code)
             st.session_state._processed_codes = processed_codes
 
-            # 1. 增量同步
-            sync_error = None
-            with st.spinner(f'正在同步 {name} ({code}) 最新数据...'):
-                sync_success, sync_msg = sync_incremental(code)
-                if not sync_success:
-                    sync_error = sync_msg
+            result = run_single_inspection(code, name, cat)
+            fund_data = result["fund_data"]
+            ai_result = result["ai_report"]  # dict: {analysis, advice, confidence}
 
-            # 2. 策略引擎
-            if sync_error:
-                fund_data = {"error": f"数据同步失败: {sync_error}"}
-            else:
-                fund_data = generate_fund_report(code, cat)
-                fund_data["fund_name"] = name  # 供 webhook 标题使用
-
-            # 3. AI 报告
-            ai_report = generate_ai_report(fund_data)
-
-            # 4. 确定视觉风格
+            # 确定视觉风格
             has_error = 'error' in fund_data
-            action = fund_data.get('decision', {}).get('action', 'ERROR')
+            action = fund_data.get('decision', {}).get('action', '持有/观望')
+            confidence = ai_result.get('confidence', 0) if isinstance(ai_result, dict) else 0
             if has_error:
-                style = ACTION_STYLES["ERROR"]
+                style = ACTION_STYLES["数据异常"]
             else:
-                style = ACTION_STYLES.get(action, ACTION_STYLES["HOLD"])
+                style = ACTION_STYLES.get(action, ACTION_STYLES["持有/观望"])
 
-            # 5. 保存结果（含计算指标）
-            inds = fund_data.get('indicators', {})
-            save_inspection_result(
-                code, name,
-                action if not has_error else "ERROR",
-                ai_report,
-                pe_percentile=inds.get('pe_percentile'),
-                pb_percentile=inds.get('pb_percentile'),
-                ma60=inds.get('ma60'),
-                ma120=inds.get('ma120'),
-            )
-
-            # 6. Webhook 推送
+            # Webhook 推送
             if new_enabled:
                 wh_urls = get_webhook_urls()
                 if wh_urls:
-                    send_to_all_webhooks(wh_urls, fund_data, ai_report)
+                    send_to_all_webhooks(wh_urls, fund_data)
 
-            # 7. 构建渲染数据 & 渲染当前卡片
+            # 构建渲染数据 & 渲染当前卡片
             today_str = datetime.now().strftime('%Y-%m-%d')
             current_card = {
                 'code': code,
@@ -573,7 +585,8 @@ with tab1:
                 'error_msg': fund_data.get('error', '') if has_error else '',
                 'indicators': fund_data.get('indicators', {}),
                 'details': fund_data.get('decision', {}).get('details', []),
-                'ai_report': ai_report,
+                'ai_report': ai_result,
+                'confidence': confidence,
             }
             render_card_header(current_card)
             render_card_expander(current_card, expanded=True)
@@ -618,8 +631,8 @@ with tab2:
     else:
         # 提取筛选选项
         fund_names = sorted(set(r['fund_name'] for r in all_records))
-        actions_list = ["STRONG_BUY", "BUY_PLAN", "HOLD", "SELL_PLAN", "ERROR"]
-        action_labels = {"STRONG_BUY": "强烈加仓", "BUY_PLAN": "定投买入", "HOLD": "持有观望", "SELL_PLAN": "止盈卖出", "ERROR": "数据异常"}
+        actions_list = ["买入", "卖出", "持有/观望", "数据异常"]
+        action_labels = {"买入": "建议买入", "卖出": "建议卖出", "持有/观望": "持有观望", "数据异常": "数据异常"}
         date_range = [r['inspect_date'] for r in all_records]
         min_date = min(date_range) if date_range else datetime.now().strftime('%Y-%m-%d')
         max_date = max(date_range) if date_range else datetime.now().strftime('%Y-%m-%d')
@@ -664,8 +677,8 @@ with tab2:
             st.info("筛选条件无匹配记录。")
         else:
             for record in filtered_records:
-                act = record.get('action', 'HOLD')
-                s = ACTION_STYLES.get(act, ACTION_STYLES["HOLD"])
+                act = record.get('action', '持有/观望')
+                s = ACTION_STYLES.get(act, ACTION_STYLES["持有/观望"])
                 
                 # 标题卡
                 st.markdown(f"""
@@ -738,3 +751,94 @@ with tab2:
                         st.info(clean_report)
                     else:
                         st.caption("- 无 AI 报告")
+
+with tab3:
+    st.subheader("📝 定制 AI 分析提示词", anchor=False)
+    st.caption("为每个监控指数编写专属分析框架，AI 将按你的提示词解读估值数据。留空则使用系统默认策略。")
+
+    if not funds:
+        st.info("监控池为空，请先在左侧「监控池管理」添加指数。")
+    else:
+        # 构建指数选择列表
+        fund_options = {f"{f['fund_name']} ({f['fund_code']})": f for f in funds}
+        selected_label = st.selectbox(
+            "选择要配置的指数",
+            list(fund_options.keys()),
+            key="prompt_fund_selector"
+        )
+
+        if selected_label:
+            fund = fund_options[selected_label]
+            code = fund['fund_code']
+            name = fund['fund_name']
+            cat = fund['category']
+
+            # 当前配置状态
+            current_prompt = get_custom_prompt(code)
+            if current_prompt:
+                st.success(f"✅ **{name}** 已配置定制提示词")
+            else:
+                st.info(f"⚪ **{name}** 使用系统默认策略（分类: {CATEGORY_NAMES.get(cat, cat)}）")
+
+            # 提示词编辑器
+            prompt_text = st.text_area(
+                "提示词内容",
+                value=current_prompt or "",
+                height=280,
+                max_chars=2000,
+                placeholder="在此输入专属分析框架，例如：\n该指数属于消费行业，侧重分析 ROE 稳定性和现金流质量...\n\n留空则使用系统默认策略。",
+                key=f"prompt_editor_{code}",
+                help="提示词将替换 AI 分析中的「估值解读框架」段落。系统红线（只能基于数据解读、不做预测、不改变决策）始终生效。"
+            )
+
+            # 指标勾选
+            st.markdown("**📊 传递给 AI 的指标**")
+            st.caption("勾选需要的指标，AI 将只看到选中项。默认仅选 PE、PB。")
+
+            saved_indicators = get_selected_indicators(code)
+            default_checked = saved_indicators if saved_indicators else ["pe", "pb"]
+
+            # 按分组展示指标 checkboxes
+            selected_keys = []
+            for group_label, group_keys in INDICATOR_GROUPS:
+                cols = st.columns(len(group_keys))
+                for i, key in enumerate(group_keys):
+                    label = INDICATOR_META[key][0]
+                    checked = cols[i].checkbox(
+                        label,
+                        value=(key in default_checked),
+                        key=f"ind_{code}_{key}",
+                    )
+                    if checked:
+                        selected_keys.append(key)
+
+            # 如果没有勾选任何指标，默认全部
+            if not selected_keys:
+                selected_keys = list(INDICATOR_META.keys())
+
+            col_btn1, col_btn2 = st.columns([1, 1])
+            with col_btn1:
+                if st.button("💾 保存提示词", key=f"save_prompt_{code}", type="primary", use_container_width=True):
+                    if prompt_text.strip():
+                        upsert_custom_prompt(code, prompt_text.strip(), indicators=selected_keys)
+                        st.success(f"已保存 {name} 的定制提示词（{len(selected_keys)} 项指标）")
+                        st.rerun()
+                    else:
+                        st.warning("提示词内容为空，请先编写后再保存。如需恢复默认，请点击「重置为默认」。")
+
+            with col_btn2:
+                if current_prompt:
+                    if st.button("🗑️ 重置为默认", key=f"reset_prompt_{code}", use_container_width=True):
+                        delete_custom_prompt(code)
+                        st.warning(f"已清除 {name} 的定制提示词，恢复系统默认策略")
+                        st.rerun()
+
+            # 使用说明
+            st.divider()
+            st.markdown("""
+            **📋 使用提示**
+            - 提示词将**替换**系统默认的「第二步：分类定价逻辑」段落，第一/三/四步保持不变
+            - 系统**绝对红线**（只能基于量化数据解读、语气冷静客观、不改变决策动作）始终生效，不可覆盖
+            - 建议关注：该指数的估值锚点（PE/PB/ROE）、行业特性、需要特别注意的风险维度
+            - 最多 2000 字符，保存后下次巡检自动生效
+            """)

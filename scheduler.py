@@ -13,16 +13,17 @@ from logger import setup_logger
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from database import get_all_funds, save_inspection_result, get_webhook_urls, get_setting
-from data_fetcher import sync_incremental, is_trade_day
-from strategy_engine import generate_fund_report
-from llm_agent import generate_ai_report
+from database import get_all_funds, get_webhook_urls, get_setting
+from data_fetcher import is_trade_day
+from inspection_pipeline import run_single_inspection
 from webhook_sender import send_to_all_webhooks
 
 logger = setup_logger("scheduler")
 
 _scheduler: BackgroundScheduler | None = None
 _lock = threading.Lock()
+
+_WDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def run_scheduled_inspection():
@@ -31,6 +32,11 @@ def run_scheduled_inspection():
     与 app.py 手动巡检共享同一流水线。
     """
     with _lock:
+        # 二次检查：调度器可能被错误启动，此处确保仅在开关开启时执行
+        if get_setting("scheduler_auto_enabled", "true") != "true":
+            logger.info("定时巡检已关闭（scheduler_auto_enabled != true），本轮任务跳过")
+            return
+
         logger.info("=== 定时巡检开始 ===")
         funds = get_all_funds()
         if not funds:
@@ -42,6 +48,10 @@ def run_scheduled_inspection():
         sync_error_count = 0
         pipeline_error_count = 0
 
+        # 循环外一次性读取 webhook 配置，避免每只标的重复查库
+        _webhook_enabled = get_setting("webhook_inspection_enabled", "false")
+        _wh_urls = get_webhook_urls() if _webhook_enabled == "true" else []
+
         for fund in funds:
             code = fund["fund_code"]
             name = fund["fund_name"]
@@ -49,40 +59,19 @@ def run_scheduled_inspection():
             logger.info(f"定时巡检: [{success_count + sync_error_count + pipeline_error_count + 1}/{total}] {name} ({code})")
 
             try:
-                # 1. 增量同步
-                sync_success, sync_msg = sync_incremental(code)
-                if not sync_success:
-                    logger.warning(f"定时巡检: {name} 同步失败 - {sync_msg}")
+                result = run_single_inspection(code, name, cat)
+
+                if result["sync_error"]:
+                    logger.warning(f"定时巡检: {name} 同步失败 - {result['sync_error']}")
                     sync_error_count += 1
                     continue
 
-                # 2. 策略引擎
-                fund_data = generate_fund_report(code, cat)
-                fund_data["fund_name"] = name
+                fund_data = result["fund_data"]
+                ai_report = result["ai_report"]
 
-                # 3. AI 报告
-                ai_report = generate_ai_report(fund_data)
-
-                # 4. 保存结果（含计算指标）
-                has_error = "error" in fund_data
-                action = fund_data.get("decision", {}).get("action", "ERROR")
-                inds = fund_data.get("indicators", {})
-                save_inspection_result(
-                    code, name,
-                    action if not has_error else "ERROR",
-                    ai_report,
-                    pe_percentile=inds.get("pe_percentile"),
-                    pb_percentile=inds.get("pb_percentile"),
-                    ma60=inds.get("ma60"),
-                    ma120=inds.get("ma120"),
-                )
-
-                # 5. Webhook 推送（尊重用户开关设置）
-                webhook_enabled = get_setting("webhook_inspection_enabled", "false")
-                if webhook_enabled == "true":
-                    wh_urls = get_webhook_urls()
-                    if wh_urls:
-                        send_to_all_webhooks(wh_urls, fund_data, ai_report)
+                # 5. Webhook 推送（使用循环外已读取的配置）
+                if _wh_urls:
+                    send_to_all_webhooks(_wh_urls, fund_data)
 
                 success_count += 1
 
@@ -104,8 +93,7 @@ def _should_run_today() -> bool:
     is_open, _ = is_trade_day(today)
     if not is_open:
         weekday = datetime.now().weekday()
-        wday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        logger.info(f"今天 {today}({wday_names[weekday]}) 为非交易日，跳过定时巡检")
+        logger.info(f"今天 {today}({_WDAY_NAMES[weekday]}) 为非交易日，跳过定时巡检")
     return is_open
 
 

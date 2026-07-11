@@ -47,6 +47,7 @@ def get_connection():
     conn = sqlite3.connect(DB_NAME)
     # 启用 WAL 模式：读写可并发，提升巡检写入时的查询性能
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -72,14 +73,24 @@ def init_db():
             CREATE TABLE IF NOT EXISTS daily_market_data (
                 fund_code TEXT NOT NULL,
                 trade_date DATE NOT NULL,
+                name TEXT,
+                open_price REAL,
+                high_price REAL,
+                low_price REAL,
                 close_price REAL,
+                change REAL,
+                pct_change REAL,
+                volume REAL,
+                amount REAL,
                 pe REAL,
                 pb REAL,
+                float_mv REAL,
+                total_mv REAL,
                 risk_free_rate REAL,
                 PRIMARY KEY (fund_code, trade_date)
             )
         ''')
-        
+
         # 表3：行业分类列表（申万行业指数）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS industry_list (
@@ -102,6 +113,7 @@ def init_db():
                 action TEXT NOT NULL,
                 ai_report TEXT,
                 inspect_date DATE DEFAULT (date('now', 'localtime')),
+                confidence INTEGER,
                 UNIQUE(fund_code, inspect_date)
             )
         ''')
@@ -142,6 +154,23 @@ def init_db():
             )
         ''')
         
+        # 表7：指数定制提示词
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS fund_custom_prompts (
+                fund_code TEXT PRIMARY KEY,
+                custom_prompt TEXT NOT NULL DEFAULT '',
+                selected_indicators TEXT NOT NULL DEFAULT '',
+                updated_at DATE DEFAULT (date('now', 'localtime')),
+                FOREIGN KEY (fund_code) REFERENCES fund_pool(fund_code)
+            )
+        ''')
+        
+        # 兼容旧表：如果已有 fund_custom_prompts 但缺少 selected_indicators 列
+        try:
+            cursor.execute("ALTER TABLE fund_custom_prompts ADD COLUMN selected_indicators TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # 列已存在，忽略
+        
         conn.commit()
     finally:
         conn.close()
@@ -170,10 +199,11 @@ def remove_fund(fund_code: str):
     try:
         conn.execute("DELETE FROM fund_pool WHERE fund_code = ?", (fund_code,))
         conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
+        conn.execute("DELETE FROM fund_custom_prompts WHERE fund_code = ?", (fund_code,))
         conn.commit()
     finally:
         conn.close()
-    logger.info(f"remove_fund: {fund_code}，已清理行情数据")
+    logger.info(f"remove_fund: {fund_code}，已清理行情数据及定制提示词")
 
 def get_all_funds() -> List[Dict]:
     conn = get_connection()
@@ -197,16 +227,28 @@ def save_daily_data(df: pd.DataFrame):
             rows.append((
                 row.get('fund_code'),
                 _norm_date(str(row.get('trade_date', ''))),
+                row.get('name'),
+                safe_float(row.get('open_price')),
+                safe_float(row.get('high_price')),
+                safe_float(row.get('low_price')),
                 safe_float(row.get('close_price')),
+                safe_float(row.get('change')),
+                safe_float(row.get('pct_change')),
+                safe_float(row.get('volume')),
+                safe_float(row.get('amount')),
                 safe_float(row.get('pe')),
                 safe_float(row.get('pb')),
+                safe_float(row.get('float_mv')),
+                safe_float(row.get('total_mv')),
                 safe_float(row.get('risk_free_rate')),
             ))
 
         cursor.executemany("""
             INSERT OR REPLACE INTO daily_market_data
-                (fund_code, trade_date, close_price, pe, pb, risk_free_rate)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (fund_code, trade_date, name, open_price, high_price, low_price,
+                 close_price, change, pct_change, volume, amount,
+                 pe, pb, float_mv, total_mv, risk_free_rate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
 
         conn.commit()
@@ -348,22 +390,23 @@ def get_industry_count() -> int:
 
 def save_inspection_result(fund_code: str, fund_name: str, action: str, ai_report: str = "",
                            pe_percentile: float = None, pb_percentile: float = None,
-                           ma60: float = None, ma120: float = None):
-    """保存巡检结果（同一标的同一天覆盖更新），含四种计算指标"""
+                           ma60: float = None, ma120: float = None,
+                           confidence: int = None):
+    """保存巡检结果（同一标的同一天覆盖更新），含计算指标与AI置信度"""
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO inspection_log
                 (fund_code, fund_name, action, ai_report, inspect_date,
-                 pe_percentile, pb_percentile, ma60, ma120)
-            VALUES (?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?)
+                 pe_percentile, pb_percentile, ma60, ma120, confidence)
+            VALUES (?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?, ?)
         """, (fund_code, fund_name, action, ai_report,
-              pe_percentile, pb_percentile, ma60, ma120))
+              pe_percentile, pb_percentile, ma60, ma120, confidence))
         conn.commit()
         logger.info(
             f"save_inspection_result: {fund_code} {fund_name} action={action} "
-            f"PE%={pe_percentile} PB%={pb_percentile} MA60={ma60} MA120={ma120}"
+            f"PE%={pe_percentile} PB%={pb_percentile} MA60={ma60} MA120={ma120} confidence={confidence}"
         )
     finally:
         conn.close()
@@ -399,25 +442,32 @@ def get_inspection_history(fund_code: str = None, action: str = None,
         conn.close()
 
 def get_market_data_for_date(fund_code: str, trade_date: str) -> Dict:
-    """查询指定标的在某日的行情数据（close_price, pe, pb, risk_free_rate）。
+    """查询指定标的在某日的全部行情数据。
     兼容数据库中 YYYYMMDD 和 YYYY-MM-DD 两种格式。"""
     conn = get_connection()
     try:
         normalized = _norm_date(trade_date)
-        # 先用规范化格式查询
         cursor = conn.execute("""
-            SELECT close_price, pe, pb, risk_free_rate
+            SELECT *
             FROM daily_market_data
             WHERE fund_code = ? AND REPLACE(trade_date, '-', '') = REPLACE(?, '-', '')
         """, (fund_code, normalized))
         row = cursor.fetchone()
         if not row:
             return {}
-        # 统一走安全转换，兼容历史 TEXT / 非数值 / NaN 等情况
         return {
             "close_price": safe_float(row["close_price"]),
+            "open_price": safe_float(row["open_price"]),
+            "high_price": safe_float(row["high_price"]),
+            "low_price": safe_float(row["low_price"]),
+            "change": safe_float(row["change"]),
+            "pct_change": safe_float(row["pct_change"]),
+            "volume": safe_float(row["volume"]),
+            "amount": safe_float(row["amount"]),
             "pe": safe_float(row["pe"]),
             "pb": safe_float(row["pb"]),
+            "float_mv": safe_float(row["float_mv"]),
+            "total_mv": safe_float(row["total_mv"]),
             "risk_free_rate": safe_float(row["risk_free_rate"]),
         }
     finally:
@@ -429,7 +479,7 @@ def get_latest_market_data(fund_code: str) -> Dict:
     conn = get_connection()
     try:
         cursor = conn.execute("""
-            SELECT close_price, pe, pb, risk_free_rate, trade_date
+            SELECT *
             FROM daily_market_data
             WHERE fund_code = ?
             ORDER BY trade_date DESC LIMIT 1
@@ -439,8 +489,17 @@ def get_latest_market_data(fund_code: str) -> Dict:
             return {}
         return {
             "close_price": safe_float(row["close_price"]),
+            "open_price": safe_float(row["open_price"]),
+            "high_price": safe_float(row["high_price"]),
+            "low_price": safe_float(row["low_price"]),
+            "change": safe_float(row["change"]),
+            "pct_change": safe_float(row["pct_change"]),
+            "volume": safe_float(row["volume"]),
+            "amount": safe_float(row["amount"]),
             "pe": safe_float(row["pe"]),
             "pb": safe_float(row["pb"]),
+            "float_mv": safe_float(row["float_mv"]),
+            "total_mv": safe_float(row["total_mv"]),
             "risk_free_rate": safe_float(row["risk_free_rate"]),
             "trade_date": _norm_date(row["trade_date"]),
         }
@@ -509,5 +568,67 @@ def set_setting(key: str, value: str):
         )
         conn.commit()
         logger.info(f"set_setting: {key} = {value}")
+    finally:
+        conn.close()
+
+
+# --- 指数定制提示词管理 ---
+def get_custom_prompt(fund_code: str) -> str | None:
+    """获取某个指数的定制提示词，未配置时返回 None"""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "SELECT custom_prompt FROM fund_custom_prompts WHERE fund_code = ?",
+            (fund_code,)
+        )
+        row = cursor.fetchone()
+        if row and row["custom_prompt"].strip():
+            return row["custom_prompt"].strip()
+        return None
+    finally:
+        conn.close()
+
+
+def get_selected_indicators(fund_code: str) -> list[str]:
+    """获取某个指数已勾选的指标列表，未配置时返回空列表"""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "SELECT selected_indicators FROM fund_custom_prompts WHERE fund_code = ?",
+            (fund_code,)
+        )
+        row = cursor.fetchone()
+        if row and row["selected_indicators"].strip():
+            return [k.strip() for k in row["selected_indicators"].split(",") if k.strip()]
+        return []
+    finally:
+        conn.close()
+
+
+def upsert_custom_prompt(fund_code: str, prompt_text: str, indicators: list[str] | None = None) -> None:
+    """插入或更新指数的定制提示词及选中的指标"""
+    indicators_str = ",".join(indicators) if indicators else ""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO fund_custom_prompts (fund_code, custom_prompt, selected_indicators, updated_at) VALUES (?, ?, ?, date('now', 'localtime'))",
+            (fund_code, prompt_text, indicators_str)
+        )
+        conn.commit()
+        logger.info(f"upsert_custom_prompt: {fund_code} prompt 已更新 ({len(prompt_text)} 字符, 指标 {len(indicators or [])} 项)")
+    finally:
+        conn.close()
+
+
+def delete_custom_prompt(fund_code: str) -> None:
+    """删除指数的定制提示词，恢复使用默认逻辑"""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "DELETE FROM fund_custom_prompts WHERE fund_code = ?",
+            (fund_code,)
+        )
+        conn.commit()
+        logger.info(f"delete_custom_prompt: {fund_code} prompt 已删除")
     finally:
         conn.close()

@@ -1,5 +1,5 @@
 import pandas as pd
-from database import get_recent_prices, calculate_percentile, get_connection, safe_float
+from database import get_recent_prices, calculate_percentile, get_latest_market_data
 from logger import setup_logger
 
 logger = setup_logger("strategy_engine")
@@ -23,25 +23,17 @@ def calculate_technical_indicators(df_prices: pd.DataFrame) -> dict:
 
 def generate_fund_report(fund_code: str, category: str) -> dict:
     """主控函数：拉取数据 -> 计算指标 -> 硬编码判定信号"""
-    conn = get_connection()
-    try:
-        # 1. 获取最新一天的基本面数据
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM daily_market_data WHERE fund_code = ? ORDER BY trade_date DESC LIMIT 1", (fund_code,))
-        latest_data = cursor.fetchone()
-    finally:
-        conn.close()
+    latest_data = get_latest_market_data(fund_code)
     
     if not latest_data:
         logger.warning(f"generate_fund_report: {fund_code} 无行情数据")
         return {"error": f"数据库中未找到 {fund_code} 的行情数据，请检查：1) 标的是否已添加 2) 历史数据是否同步成功 3) 标的代码格式是否正确（如 000300.SH）"}
         
-    latest_data = dict(latest_data)
-    # pe/pb/risk_free_rate 在此统一转 float（兼容历史 TEXT 数据）
+    # pe/pb/risk_free_rate 已在 get_latest_market_data 中通过 safe_float 转换
     # close_price 在 get_recent_prices 中通过 pd.to_numeric 统一转数值
-    pe = safe_float(latest_data['pe'])
-    pb = safe_float(latest_data['pb'])
-    risk_free = safe_float(latest_data['risk_free_rate'])
+    pe = latest_data['pe']
+    pb = latest_data['pb']
+    risk_free = latest_data['risk_free_rate']
     
     # 2. 计算基本面的推导指标和历史分位
     pe_percentile = calculate_percentile(fund_code, 'pe', pe) if pe is not None else None
@@ -73,105 +65,11 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
         "risk_premium": risk_premium
     }
     
-    # 4. 【核心硬逻辑】分支判定，输出强结构化信号
-    signal = _apply_hard_rules(category, indicators)
-    
-    logger.info(f"generate_fund_report: {fund_code} (category={category}) PE={pe} PB={pb} PE%={pe_percentile} action={signal['action']}")
+    logger.info(f"generate_fund_report: {fund_code} (category={category}) PE={pe} PB={pb} PE%={pe_percentile}")
     
     return {
         "fund_code": fund_code,
         "category": category,
-        "indicators": indicators,
-        "decision": signal
+        "indicators": indicators
     }
 
-def _apply_hard_rules(category: str, inds: dict) -> dict:
-    """根据分类，执行硬编码的 If-Else 规则树"""
-    action = "HOLD"
-    logic_details = []
-
-    pe_pct = inds.get("pe_percentile")
-    pb_pct = inds.get("pb_percentile")
-    price = inds.get("price")
-    ma60 = inds.get("ma60")
-    ma120 = inds.get("ma120")
-    rp = inds.get("risk_premium")
-
-    if category == 'wide_base':
-        # 宽基指数逻辑
-        if pe_pct is not None:
-            if pe_pct < 0.20:
-                if price is not None and ma60 is not None and price > ma60:
-                    action = "STRONG_BUY"
-                    logic_details.append("极度低估 (PE分位<20%) 且 价格突破60日趋势线，触发强烈加仓。")
-                else:
-                    action = "BUY_PLAN"
-                    logic_details.append("极度低估 (PE分位<20%) 但趋势未确立，仅执行左侧大额定投。")
-            elif pe_pct < 0.50:
-                action = "BUY_PLAN"
-                logic_details.append("估值适中偏低 (PE分位<50%)，维持常规额度定投。")
-            elif pe_pct > 0.80 or (rp is not None and rp < 0.03):
-                action = "SELL_PLAN"
-                logic_details.append("高估值或风险溢价过低，建议分批止盈并停止定投。")
-            else:
-                action = "HOLD"
-                logic_details.append("估值在合理中枢内，持有观望。")
-        else:
-            logic_details.append(f"PE分位数无法计算（历史数据不足100条），当前PE={inds.get('pe')}，暂维持持有观望。")
-                
-    elif category == 'tech_growth':
-        # 科技成长逻辑（强调用趋势过滤，防止左侧接飞刀）
-        if pe_pct is not None and price is not None and ma120 is not None:
-            if pe_pct < 0.30 and price > ma120:
-                action = "STRONG_BUY"
-                logic_details.append("估值便宜 (PE分位<30%) 且站上120日牛熊线，右侧信号确立，执行买入。")
-            elif pe_pct < 0.10:
-                action = "BUY_PLAN"
-                logic_details.append("估值极度压缩 (PE分位<10%)，但均线处于空头，只进行小资金试探定投。")
-            elif price < ma120:
-                action = "HOLD"
-                logic_details.append("趋势破位 (跌破120日线)，暂停加仓，保护本金。")
-            else:
-                logic_details.append(f"PE分位{pe_pct*100:.1f}%处于中性区间，价格站上MA120，暂无明确信号，持有观望。")
-        else:
-            missing = []
-            if pe_pct is None: missing.append("PE分位数")
-            if price is None: missing.append("当前价格")
-            if ma120 is None: missing.append("MA120")
-            logic_details.append(f"指标缺失({','.join(missing)})，无法判定信号，维持持有。")
-
-    elif category == 'cycle_mfg':
-        # 周期制造逻辑
-        if pb_pct is not None:
-            if pb_pct < 0.15:
-                action = "BUY_PLAN"
-                logic_details.append("周期底部确认 (PB分位<15%)，全行业破净，开启左侧建仓。")
-            elif pb_pct > 0.85:
-                action = "SELL_PLAN"
-                logic_details.append("景气度见顶 (PB分位>85%)，执行清仓卖出。")
-            else:
-                logic_details.append(f"PB分位{pb_pct*100:.1f}%处于中枢区间(15%~85%)，无明确买卖信号，持有观望。")
-        else:
-            logic_details.append(f"PB分位数无法计算（历史数据不足100条），当前PB={inds.get('pb')}，暂维持持有。")
-
-    elif category == 'dividend':
-        # 红利稳健逻辑
-        pe_val = inds.get("pe")
-        if pb_pct is not None and pe_val is not None:
-             if pb_pct < 0.50 and pe_val < 15:
-                 action = "BUY_PLAN"
-                 logic_details.append("估值合理，提供充分安全垫，适合稳健吃息买入。")
-             elif price is not None and ma120 is not None and price < ma120:
-                 logic_details.append("趋势向下，仅定投不单笔大额加仓。")
-             else:
-                 logic_details.append(f"PB分位{pb_pct*100:.1f}%，PE={pe_val:.1f}，不满足买入条件，持有观望。")
-        else:
-            missing = []
-            if pb_pct is None: missing.append("PB分位数")
-            if pe_val is None: missing.append("PE")
-            logic_details.append(f"指标缺失({','.join(missing)})，无法判定信号，维持持有。")
-
-    return {
-        "action": action, 
-        "details": logic_details
-    }
