@@ -36,12 +36,14 @@ INDICATOR_META: dict = {
     "risk_premium":   ("风险溢价",             lambda v: f"{v*100:.2f}%" if v is not None else None),
     "ma60":           ("60日均线",             lambda v: f"{v:.3f}" if v is not None else None),
     "ma120":          ("120日均线",            lambda v: f"{v:.3f}" if v is not None else None),
+    "amount":         ("成交额 (万元)",         lambda v: f"{v:.0f}" if v is not None else None),
+    "amount_ma20":    ("20日均成交额",          lambda v: f"{v:.0f}" if v is not None else None),
 }
 
 # 指标分组（用于 user_prompt 中按类别展示）
 INDICATOR_GROUPS = [
     ("基本面数据", ["pe", "pe_percentile", "pb", "pb_percentile", "roe", "risk_premium"]),
-    ("行情与技术面", ["price", "ma60", "ma120"]),
+    ("行情与技术面", ["price", "ma60", "ma120", "amount", "amount_ma20"]),
 ]
 
 # 默认全部指标（向后兼容：未配置指标筛选时使用）
@@ -152,7 +154,6 @@ def _parse_ai_json(raw: str) -> dict:
 
 def _build_system_prompt(category: str, custom_prompt: str | None) -> str:
     """构建 System Prompt：prompt.md 基础 + 策略描述 + JSON Schema 约束"""
-    base = _load_prompt_md()
 
     json_schema = (
         "# 输出格式（严格遵守）\n"
@@ -168,9 +169,10 @@ def _build_system_prompt(category: str, custom_prompt: str | None) -> str:
     )
 
     if custom_prompt and custom_prompt.strip():
-        # 用户定制提示词：替换默认分类策略，作为唯一的分析框架
-        prompt = f"{base}\n\n# 投资策略框架（用户定制）\n{custom_prompt.strip()}"
+        # 用户定制提示词：用户已含 Role/Task，不叠加系统基础提示词，仅追加输出格式
+        prompt = custom_prompt.strip()
     else:
+        base = _load_prompt_md()
         strategy_desc = CATEGORY_STRATEGIES.get(category, "根据指数分类标签，参考通用估值分析逻辑。")
         prompt = f"{base}\n\n# 投资策略框架\n{strategy_desc}"
 
@@ -217,6 +219,15 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
 
     try:
         logger.info(f"generate_ai_report: {code} (category={cat}), 调用 {MODEL_NAME}")
+
+        # 记录发送给 AI 的完整内容（DEBUG 级别，生产环境可关闭控制台输出）
+        logger.debug(
+            f"generate_ai_report: {code} → AI 请求内容\n"
+            f"--- System Prompt ---\n{system_prompt}\n"
+            f"--- User Prompt ---\n{user_prompt}\n"
+            f"--- 结束 ---"
+        )
+
         response = _get_client().chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -224,10 +235,40 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
-            max_tokens=800
+            max_tokens=16384
         )
-        raw = response.choices[0].message.content
-        logger.info(f"generate_ai_report: {code} 返回 {len(raw)} 字符")
+        choice = response.choices[0] if response.choices else None
+        raw = choice.message.content if choice else None
+        finish_reason = choice.finish_reason if choice else "N/A（无 choices）"
+
+        # 记录 token 用量
+        usage = response.usage
+        if usage:
+            logger.debug(
+                f"generate_ai_report: {code} token 用量 "
+                f"prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
+                f"total={usage.total_tokens}"
+            )
+
+        # 记录 AI 返回的原始内容（DEBUG 级别）
+        raw_len = len(raw) if raw else 0
+        logger.debug(
+            f"generate_ai_report: {code} ← AI 返回内容 ({raw_len} 字符) "
+            f"finish_reason={finish_reason}\n"
+            f"--- 原始输出 ---\n{raw or '(空)'}\n"
+            f"--- 结束 ---"
+        )
+
+        # 空响应显式告警
+        if not raw:
+            logger.warning(
+                f"generate_ai_report: {code} AI 返回空内容！"
+                f" finish_reason={finish_reason}"
+                f" (若为 content_filter 则说明 prompt 被安全过滤拦截)"
+            )
+            return _parse_ai_json("")
+
+        logger.info(f"generate_ai_report: {code} 返回 {raw_len} 字符, finish_reason={finish_reason}")
         return _parse_ai_json(raw)
     except openai.APIError as e:
         logger.error(f"generate_ai_report: APIError - {e}")

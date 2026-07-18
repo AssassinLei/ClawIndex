@@ -195,6 +195,8 @@ def render_card_expander(card: dict, expanded: bool = False):
                     st.metric("风险溢价",    _fmt(inds.get("risk_premium"), "{:.4f}"))
                     st.metric("60日均线",    _fmt(inds.get("ma60"), "{:.3f}"))
                     st.metric("120日均线",   _fmt(inds.get("ma120"), "{:.3f}"))
+                    st.metric("成交额 (万元)", _fmt(inds.get("amount"), "{:.0f}"))
+                    st.metric("20日均成交额", _fmt(inds.get("amount_ma20"), "{:.0f}"))
 
             # ===== 右列：操作建议 → 分析 → 置信度 =====
             with col_right:
@@ -470,7 +472,7 @@ if webhook_urls:
 else:
     st.sidebar.caption("暂无 Webhook 地址，请添加")
 
-st.sidebar.caption("当前版本 V0.23")
+st.sidebar.caption("当前版本 V0.3")
 
 # --- 主页面：巡检核心工作流 ---
 logo_svg = LOGO_PATH.read_text(encoding="utf-8")
@@ -759,6 +761,11 @@ with tab3:
     if not funds:
         st.info("监控池为空，请先在左侧「监控池管理」添加指数。")
     else:
+        # 显示保存成功提示（跨 rerun 持久化）
+        saved_msg = st.session_state.pop("prompt_saved_msg", None)
+        if saved_msg:
+            st.success(f"💾 {saved_msg}")
+
         # 构建指数选择列表
         fund_options = {f"{f['fund_name']} ({f['fund_code']})": f for f in funds}
         selected_label = st.selectbox(
@@ -798,6 +805,11 @@ with tab3:
             saved_indicators = get_selected_indicators(code)
             default_checked = saved_indicators if saved_indicators else ["pe", "pb"]
 
+            if st.button("☑️ 全选", key=f"select_all_{code}", use_container_width=True):
+                for key in INDICATOR_META:
+                    st.session_state[f"ind_{code}_{key}"] = True
+                st.rerun()
+
             # 按分组展示指标 checkboxes
             selected_keys = []
             for group_label, group_keys in INDICATOR_GROUPS:
@@ -821,7 +833,7 @@ with tab3:
                 if st.button("💾 保存提示词", key=f"save_prompt_{code}", type="primary", use_container_width=True):
                     if prompt_text.strip():
                         upsert_custom_prompt(code, prompt_text.strip(), indicators=selected_keys)
-                        st.success(f"已保存 {name} 的定制提示词（{len(selected_keys)} 项指标）")
+                        st.session_state.prompt_saved_msg = f"已保存 {name} 的定制提示词（{len(selected_keys)} 项指标）"
                         st.rerun()
                     else:
                         st.warning("提示词内容为空，请先编写后再保存。如需恢复默认，请点击「重置为默认」。")

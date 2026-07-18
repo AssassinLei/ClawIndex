@@ -5,20 +5,22 @@ from logger import setup_logger
 logger = setup_logger("strategy_engine")
 
 def calculate_technical_indicators(df_prices: pd.DataFrame) -> dict:
-    """基于近期价格，计算技术面指标"""
+    """基于近期价格与成交额，计算技术面指标"""
     if df_prices.empty or len(df_prices) < 120:
-        return {"current_price": None, "ma60": None, "ma120": None}
+        return {"current_price": None, "ma60": None, "ma120": None, "amount_ma20": None}
     
     # 计算移动平均线
     df_prices['ma60'] = df_prices['close_price'].rolling(window=60).mean()
     df_prices['ma120'] = df_prices['close_price'].rolling(window=120).mean()
+    df_prices['amount_ma20'] = df_prices['amount'].rolling(window=20).mean()
     
     latest_row = df_prices.iloc[-1]
     
     return {
         "current_price": latest_row['close_price'],
         "ma60": latest_row['ma60'],
-        "ma120": latest_row['ma120']
+        "ma120": latest_row['ma120'],
+        "amount_ma20": latest_row['amount_ma20'],
     }
 
 def generate_fund_report(fund_code: str, category: str) -> dict:
@@ -51,6 +53,10 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
     current_price = tech_inds['current_price']
     ma60 = tech_inds['ma60']
     ma120 = tech_inds['ma120']
+    amount_ma20 = tech_inds['amount_ma20']
+
+    # 4. 提取当日成交额
+    amount = latest_data.get('amount')
 
     # 组装完整的指标库用于判定
     indicators = {
@@ -62,7 +68,9 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
         "pe_percentile": pe_percentile,
         "pb_percentile": pb_percentile,
         "roe": roe,
-        "risk_premium": risk_premium
+        "risk_premium": risk_premium,
+        "amount": amount,
+        "amount_ma20": amount_ma20,
     }
     
     logger.info(f"generate_fund_report: {fund_code} (category={category}) PE={pe} PB={pb} PE%={pe_percentile}")

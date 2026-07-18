@@ -74,6 +74,8 @@ def run_single_inspection(fund_code: str, fund_name: str, category: str) -> dict
         pb_percentile=inds.get("pb_percentile"),
         ma60=inds.get("ma60"),
         ma120=inds.get("ma120"),
+        amount=inds.get("amount"),
+        amount_ma20=inds.get("amount_ma20"),
         confidence=confidence,
     )
 

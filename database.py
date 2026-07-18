@@ -114,27 +114,15 @@ def init_db():
                 ai_report TEXT,
                 inspect_date DATE DEFAULT (date('now', 'localtime')),
                 confidence INTEGER,
+                pe_percentile REAL,
+                pb_percentile REAL,
+                ma60 REAL,
+                ma120 REAL,
+                amount REAL,
+                amount_ma20 REAL,
                 UNIQUE(fund_code, inspect_date)
             )
         ''')
-        
-        # 兼容旧表：如果已有 inspection_log 但缺少 ai_report 列，则追加
-        try:
-            cursor.execute("ALTER TABLE inspection_log ADD COLUMN ai_report TEXT")
-        except sqlite3.OperationalError:
-            pass  # 列已存在，忽略
-
-        # 兼容旧表：新增四种计算指标列
-        for col_info in [
-            ("pe_percentile", "REAL"),
-            ("pb_percentile", "REAL"),
-            ("ma60", "REAL"),
-            ("ma120", "REAL"),
-        ]:
-            try:
-                cursor.execute(f"ALTER TABLE inspection_log ADD COLUMN {col_info[0]} {col_info[1]}")
-            except sqlite3.OperationalError:
-                pass  # 列已存在，忽略
         
         # 表5：Webhook 地址配置
         cursor.execute('''
@@ -197,9 +185,10 @@ def add_fund(fund_code: str, fund_name: str, category: str) -> bool:
 def remove_fund(fund_code: str):
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM fund_pool WHERE fund_code = ?", (fund_code,))
-        conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
+        # 必须先删子表（有 FOREIGN KEY 引用 fund_pool），再删主表
         conn.execute("DELETE FROM fund_custom_prompts WHERE fund_code = ?", (fund_code,))
+        conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
+        conn.execute("DELETE FROM fund_pool WHERE fund_code = ?", (fund_code,))
         conn.commit()
     finally:
         conn.close()
@@ -273,12 +262,12 @@ def get_latest_trade_date(fund_code: str) -> str:
         conn.close()
 
 def get_recent_prices(fund_code: str, days: int = 150) -> pd.DataFrame:
-    """获取最近N天的价格，用于计算移动平均线(SMA)等技术指标"""
+    """获取最近N天的价格与成交额，用于计算移动平均线等技术指标"""
     conn = get_connection()
     try:
         # 使用 REPLACE 去横线后排序，兼容 YYYYMMDD / YYYY-MM-DD 两种格式
         query = """
-            SELECT trade_date, close_price 
+            SELECT trade_date, close_price, amount
             FROM daily_market_data 
             WHERE fund_code = ? 
             ORDER BY REPLACE(trade_date, '-', '') DESC LIMIT ?
@@ -288,6 +277,7 @@ def get_recent_prices(fund_code: str, days: int = 150) -> pd.DataFrame:
         conn.close()
     # 确保 close_price 为数值类型（兼容历史 TEXT 数据）
     df['close_price'] = pd.to_numeric(df['close_price'], errors='coerce')
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
     # 统一日期格式再排序，避免字典序陷阱
     df['trade_date'] = df['trade_date'].astype(str).apply(_norm_date)
     # 返回正序排序的数据，方便计算指标
@@ -391,6 +381,7 @@ def get_industry_count() -> int:
 def save_inspection_result(fund_code: str, fund_name: str, action: str, ai_report: str = "",
                            pe_percentile: float = None, pb_percentile: float = None,
                            ma60: float = None, ma120: float = None,
+                           amount: float = None, amount_ma20: float = None,
                            confidence: int = None):
     """保存巡检结果（同一标的同一天覆盖更新），含计算指标与AI置信度"""
     conn = get_connection()
@@ -399,10 +390,10 @@ def save_inspection_result(fund_code: str, fund_name: str, action: str, ai_repor
         cursor.execute("""
             INSERT OR REPLACE INTO inspection_log
                 (fund_code, fund_name, action, ai_report, inspect_date,
-                 pe_percentile, pb_percentile, ma60, ma120, confidence)
-            VALUES (?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?, ?)
+                 pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence)
+            VALUES (?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?)
         """, (fund_code, fund_name, action, ai_report,
-              pe_percentile, pb_percentile, ma60, ma120, confidence))
+              pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence))
         conn.commit()
         logger.info(
             f"save_inspection_result: {fund_code} {fund_name} action={action} "
