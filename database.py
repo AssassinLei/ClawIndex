@@ -283,6 +283,35 @@ def get_recent_prices(fund_code: str, days: int = 150) -> pd.DataFrame:
     # 返回正序排序的数据，方便计算指标
     return df.sort_values(by='trade_date').reset_index(drop=True)
 
+
+def get_indicator_history(fund_code: str, columns: list[str]) -> pd.DataFrame:
+    """获取指定标的的历史指标时序数据，供趋势图使用。
+
+    白名单校验 columns 防止 SQL 注入，仅允许 daily_market_data 中的数值列。
+    返回 DataFrame 含 trade_date + 请求列，按日期正序排列。
+    """
+    ALLOWED = {'close_price', 'pe', 'pb', 'amount', 'risk_free_rate'}
+    safe_cols = [c for c in columns if c in ALLOWED]
+    if not safe_cols:
+        return pd.DataFrame()
+    cols_str = ', '.join(safe_cols)
+    conn = get_connection()
+    try:
+        query = (
+            f"SELECT trade_date, {cols_str} FROM daily_market_data "
+            f"WHERE fund_code = ? "
+            f"ORDER BY REPLACE(trade_date, '-', '') ASC"
+        )
+        df = pd.read_sql_query(query, conn, params=(fund_code,))
+    finally:
+        conn.close()
+    if df.empty:
+        return df
+    df['trade_date'] = df['trade_date'].astype(str).apply(_norm_date)
+    for col in safe_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
 def calculate_percentile(fund_code: str, indicator: str, current_value: float, lookback_days: int = 2500) -> float:
     """
     利用 SQL 计算指定指标（如 PE, PB）的历史分位数。

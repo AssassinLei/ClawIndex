@@ -5,14 +5,14 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, get_inspection_history, get_market_data_for_date, get_latest_market_data, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt
+from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, is_trade_day
 from llm_agent import INDICATOR_META, INDICATOR_GROUPS
 from webhook_sender import send_to_all_webhooks
 from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running
 from constants import CATEGORY_NAMES
 from inspection_pipeline import run_single_inspection
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 LOGO_PATH = ASSETS_DIR / "clawindex_logo.svg"
@@ -140,6 +140,87 @@ ACTION_STYLES = {
     "数据异常":   {"color": "#6b7280", "bg": "#f9fafb", "border": "#9ca3af", "icon": "⚠️", "label": "数据异常"},
 }
 
+# 可点击查看历史趋势的指标：key → (DB列列表, 转换函数或None, 中文标题, 公式说明)
+TREND_INDICATORS = {
+    'close_price':   (['close_price'],                   None,
+                      "收盘价",                            "数据来源：Tushare 申万指数日线行情"),
+    'pe':            (['pe'],                             None,
+                      "市盈率 (PE)",                       "数据来源：Tushare 申万指数日线行情"),
+    'pb':            (['pb'],                             None,
+                      "市净率 (PB)",                       "数据来源：Tushare 申万指数日线行情"),
+    'pb_percentile': (['pb'],                             lambda df: df['pb'].expanding().rank(pct=True),
+                      "PB 历史分位",                       "计算方式：PB 从最早至今的累积历史分位（expanding rank）"),
+    'roe':           (['pe', 'pb'],                       lambda df: df['pb'] / df['pe'].replace(0, None),
+                      "ROE",                              "计算方式：PB ÷ PE（需 PE > 0）"),
+    'risk_premium':  (['pe', 'risk_free_rate'],           lambda df: 1/df['pe'].replace(0, None) - df['risk_free_rate'],
+                      "风险溢价",                          "计算方式：1 ÷ PE − 无风险利率（Fed 模型）\n无风险利率 = 10 年期国债收益率"),
+    'amount':        (['amount'],                         None,
+                      "成交额",                            "数据来源：Tushare 申万指数日线行情"),
+}
+
+
+# 趋势图时间范围选项：标签 → timedelta 偏移量（None 为全部）
+TREND_RANGE_OPTIONS = {
+    "全部":  None,
+    "近3年": timedelta(days=365 * 3),
+    "近1年": timedelta(days=365),
+    "近1月": timedelta(days=30),
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_history_for_trend(fund_code: str) -> pd.DataFrame:
+    """加载某标的的全部历史数据（缓存1小时），供趋势图复用。"""
+    from database import get_indicator_history
+    return get_indicator_history(fund_code, ['close_price', 'pe', 'pb', 'amount', 'risk_free_rate'])
+
+
+def render_trend_chart(fund_code: str, indicator_key: str, title: str):
+    """在 popover 内部渲染单个指标的历史趋势折线图（支持时间范围筛选）。"""
+    meta = TREND_INDICATORS.get(indicator_key)
+    if not meta:
+        st.caption("不支持的指标类型")
+        return
+
+    df = _load_history_for_trend(fund_code)
+    if df.empty or len(df) < 5:
+        st.caption("暂无足够历史数据")
+        return
+
+    # 阶段1: 基于全量数据计算 Y 轴（保证 expanding.rank 等派生指标正确）
+    transform = meta[1]
+    if transform:
+        df['_value'] = transform(df)
+    else:
+        df['_value'] = df[meta[0][0]]
+
+    chart_df = df[['trade_date', '_value']].dropna().set_index('trade_date')
+    if chart_df.empty:
+        st.caption("暂无有效数据")
+        return
+
+    # 阶段2: 时间范围选择器（label_visibility="collapsed" 复用 app.py:327 现有模式）
+    time_range = st.radio(
+        "时间范围",
+        list(TREND_RANGE_OPTIONS.keys()),
+        horizontal=True,
+        key=f"trend_range_{fund_code}_{indicator_key}",
+        label_visibility="collapsed",
+    )
+
+    # 阶段3: 过滤后渲染（YYYY-MM-DD 字符串字典序 ≡ 时间序，无需 pd.to_datetime）
+    offset = TREND_RANGE_OPTIONS[time_range]
+    if offset is not None:
+        cutoff = (datetime.now() - offset).strftime("%Y-%m-%d")
+        chart_df = chart_df[chart_df.index >= cutoff]
+        if chart_df.empty:
+            st.caption(f"所选时间范围「{time_range}」内暂无数据")
+            return
+
+    st.line_chart(chart_df, use_container_width=True)
+    st.caption(f"共 {len(chart_df)} 个交易日 · {chart_df.index[0]} ~ {chart_df.index[-1]}")
+
+
 # --- 巡检卡片渲染辅助函数 ---
 def render_card_header(card: dict):
     """渲染巡检卡片的彩色标题栏"""
@@ -182,21 +263,42 @@ def render_card_expander(card: dict, expanded: bool = False):
                     except (ValueError, TypeError):
                         return str(v)
 
-                # 用嵌套 2 列紧凑排列
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.metric("当前价格",  _fmt(inds.get("price"), "{:.3f}"))
-                    st.metric("市盈率 (PE)", _fmt(inds.get("pe")))
-                    st.metric("PE 历史分位", f"{inds['pe_percentile'] * 100:.1f}%" if inds.get("pe_percentile") is not None else "N/A")
-                    st.metric("市净率 (PB)", _fmt(inds.get("pb")))
-                    st.metric("ROE",         f"{inds['roe'] * 100:.2f}%" if inds.get("roe") is not None else "N/A")
-                with c2:
-                    st.metric("PB 历史分位", f"{inds['pb_percentile'] * 100:.1f}%" if inds.get("pb_percentile") is not None else "N/A")
-                    st.metric("风险溢价",    _fmt(inds.get("risk_premium"), "{:.4f}"))
-                    st.metric("60日均线",    _fmt(inds.get("ma60"), "{:.3f}"))
-                    st.metric("120日均线",   _fmt(inds.get("ma120"), "{:.3f}"))
-                    st.metric("成交额 (万元)", _fmt(inds.get("amount"), "{:.0f}"))
-                    st.metric("20日均成交额", _fmt(inds.get("amount_ma20"), "{:.0f}"))
+                # 每行一对指标，用 4 列布局（指标A | 按钮A | 指标B | 按钮B）
+                # key=None 表示该指标不可点击，按钮列留空
+                code = card['code']
+                metric_rows = [
+                    ("当前价格",  _fmt(inds.get("price"), "{:.3f}"), 'close_price',
+                     "PB 历史分位", f"{inds['pb_percentile'] * 100:.1f}%" if inds.get("pb_percentile") is not None else "N/A", 'pb_percentile'),
+                    ("市盈率 (PE)", _fmt(inds.get("pe")), 'pe',
+                     "风险溢价",    _fmt(inds.get("risk_premium"), "{:.4f}"), 'risk_premium'),
+                    ("PE 历史分位", f"{inds['pe_percentile'] * 100:.1f}%" if inds.get("pe_percentile") is not None else "N/A", None,
+                     "60日均线",    _fmt(inds.get("ma60"), "{:.3f}"), None),
+                    ("市净率 (PB)", _fmt(inds.get("pb")), 'pb',
+                     "120日均线",   _fmt(inds.get("ma120"), "{:.3f}"), None),
+                    ("ROE",         f"{inds['roe'] * 100:.2f}%" if inds.get("roe") is not None else "N/A", 'roe',
+                     "成交额", _fmt(inds.get("amount"), "{:.0f}"), 'amount'),
+                ]
+                # 最后一行只有右侧指标（20日均成交额不可点击）
+                last_row = (None, None, None, "20日均成交额", _fmt(inds.get("amount_ma20"), "{:.0f}"), None)
+
+                for label_a, val_a, key_a, label_b, val_b, key_b in metric_rows + [last_row]:
+                    mc_a, mb_a, mc_b, mb_b = st.columns([0.37, 0.13, 0.37, 0.13])
+                    if label_a:
+                        with mc_a:
+                            st.metric(label_a, val_a)
+                        with mb_a:
+                            if key_a:
+                                formula = TREND_INDICATORS.get(key_a, (None,None,None,""))[3]
+                                with st.popover("📈", help=f"查看 {label_a} 历史趋势\n\n{formula}"):
+                                    render_trend_chart(code, key_a, label_a)
+                    if label_b:
+                        with mc_b:
+                            st.metric(label_b, val_b)
+                        with mb_b:
+                            if key_b:
+                                formula = TREND_INDICATORS.get(key_b, (None,None,None,""))[3]
+                                with st.popover("📈", help=f"查看 {label_b} 历史趋势\n\n{formula}"):
+                                    render_trend_chart(code, key_b, label_b)
 
             # ===== 右列：操作建议 → 分析 → 置信度 =====
             with col_right:
