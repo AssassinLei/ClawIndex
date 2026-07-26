@@ -4,12 +4,18 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import os
-from database import save_daily_data, get_connection, get_latest_trade_date, save_industry_list
+from database import (
+    save_daily_data, get_connection, get_latest_trade_date, save_industry_list,
+    save_idx_factor_data, get_latest_factor_trade_date, IDX_FACTOR_COLUMNS,
+)
 from logger import setup_logger
 
 logger = setup_logger("data_fetcher")
 
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
+
+# idx_factor_pro 接口请求字段（与 idx_factor_data 表列一一对应）
+IDX_FACTOR_FIELDS = 'ts_code,trade_date,' + ','.join(IDX_FACTOR_COLUMNS)
 
 _pro = None
 
@@ -222,6 +228,77 @@ def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[
         logger.error(error_msg)
         return pd.DataFrame(), error_msg
 
+def fetch_idx_factor(fund_code: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, str]:
+    """
+    获取指定区间的指数技术面因子数据（idx_factor_pro 专业版）。
+    输出 MACD/KDJ/RSI/BOLL/CCI/DMI 等 78 项技术因子 + 行情 9 项。
+    返回: (DataFrame, error_message)
+    """
+    try:
+        logger.info(f"idx_factor_pro 请求: ts_code={fund_code}, start={start_date}, end={end_date}")
+        df = _get_pro().idx_factor_pro(
+            ts_code=fund_code,
+            start_date=start_date,
+            end_date=end_date,
+            fields=IDX_FACTOR_FIELDS
+        )
+
+        logger.info(f"idx_factor_pro 返回: {len(df)} 行")
+
+        if df.empty:
+            return pd.DataFrame(), (
+                f"idx_factor_pro 接口返回空数据\n"
+                f"请求参数: ts_code={fund_code}, start_date={start_date}, end_date={end_date}\n"
+                f"可能原因: 1) 标的代码不正确 2) Tushare账户无idx_factor_pro接口权限（需5000积分） 3) 该区间无因子数据"
+            )
+
+        df.rename(columns={'ts_code': 'fund_code'}, inplace=True)
+        df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y-%m-%d')
+        df.drop_duplicates(subset=['fund_code', 'trade_date'], inplace=True)
+
+        logger.info(f"fetch_idx_factor: 最终 {len(df)} 行, 日期 {df['trade_date'].min()}~{df['trade_date'].max()}")
+        return df, ""
+
+    except Exception as e:
+        error_msg = f"idx_factor_pro 接口调用失败: {type(e).__name__}: {str(e)}"
+        logger.error(error_msg)
+        return pd.DataFrame(), error_msg
+
+def fetch_index_members(index_code: str, level: str) -> tuple[pd.DataFrame, str]:
+    """
+    实时获取申万行业指数的成分股列表（index_member_all 接口）。
+    按行业层级传参：L1 → l1_code，L2 → l2_code，L3 → l3_code。
+    成分数据变化频繁，纯实时查询，不写入数据库。
+    返回: (DataFrame, error_message)
+    """
+    level_param = {'L1': 'l1_code', 'L2': 'l2_code', 'L3': 'l3_code'}.get(level)
+    if level_param is None:
+        return pd.DataFrame(), f"未知的行业层级: {level}（仅支持 L1/L2/L3）"
+
+    try:
+        logger.info(f"index_member_all 请求: {level_param}={index_code}")
+        df = _get_pro().index_member_all(
+            **{level_param: index_code},
+            is_new='Y',
+            fields='l1_name,l2_name,l3_name,ts_code,name,in_date'
+        )
+
+        logger.info(f"index_member_all 返回: {len(df)} 行")
+
+        if df.empty:
+            return pd.DataFrame(), (
+                f"index_member_all 接口返回空数据\n"
+                f"请求参数: {level_param}={index_code}, is_new=Y\n"
+                f"可能原因: 1) 行业代码不正确 2) Tushare账户无index_member_all接口权限（需2000积分）"
+            )
+
+        return df, ""
+
+    except Exception as e:
+        error_msg = f"index_member_all 接口调用失败: {type(e).__name__}: {str(e)}"
+        logger.error(error_msg)
+        return pd.DataFrame(), error_msg
+
 def sync_all_history(fund_code: str) -> tuple[bool, str]:
     """
     初始化函数：当在前端添加新基金时，调用此函数拉取过去 10 年的数据落库。
@@ -248,13 +325,66 @@ def sync_all_history(fund_code: str) -> tuple[bool, str]:
     msg = f"成功同步 {fund_code} 共 {len(df)} 条历史数据（{df['trade_date'].min()} ~ {df['trade_date'].max()}）"
     logger.info(f"sync_all_history: {msg}")
     
+    # 同步技术因子（失败不阻断主流程，巡检时会自动重试补齐）
+    df_factor, factor_error = fetch_idx_factor(fund_code, start_str, end_str)
+    if factor_error:
+        logger.warning(f"sync_all_history: 技术因子同步失败（不影响行情数据）- {factor_error}")
+        msg += "；技术因子同步失败，将在巡检时自动重试"
+    else:
+        save_idx_factor_data(df_factor)
+        msg += f"；技术因子 {len(df_factor)} 条"
+        logger.info(f"sync_all_history: {fund_code} 技术因子同步 {len(df_factor)} 条")
+    
     # 必须休眠防止 Tushare 限流封号
     time.sleep(2)
     return True, msg
 
+def _sync_factor_incremental(fund_code: str, today: str):
+    """
+    技术因子增量补齐（独立于行情同步判断缺口）。
+    失败仅记录日志，不影响巡检主流程。
+    """
+    factor_latest = get_latest_factor_trade_date(fund_code)
+    
+    if factor_latest is None:
+        # 添加标的时因子同步失败（如无权限），重试全量拉取近10年
+        start = (datetime.now() - timedelta(days=365 * 10)).strftime('%Y%m%d')
+    else:
+        factor_latest_clean = factor_latest.replace('-', '').replace('/', '')
+        if factor_latest_clean >= today:
+            return  # 因子数据已是最新
+        start = (datetime.strptime(factor_latest_clean, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
+    
+    logger.info(f"_sync_factor_incremental: {fund_code} 因子增量拉取 {start}~{today}")
+    df, error = fetch_idx_factor(fund_code, start, today)
+    
+    if error:
+        if '接口返回空数据' in error:
+            logger.info(f"_sync_factor_incremental: {fund_code} 无新因子数据（今日可能尚未发布）")
+        else:
+            logger.warning(f"_sync_factor_incremental: {fund_code} 因子同步失败（不影响巡检）- {error}")
+        return
+    
+    if df.empty:
+        return
+    
+    save_idx_factor_data(df)
+    logger.info(f"_sync_factor_incremental: {fund_code} 新增 {len(df)} 条因子数据")
+
 def sync_incremental(fund_code: str) -> tuple[bool, str]:
     """
-    增量同步：从数据库最新日期到今天的行情数据。
+    增量同步：行情数据 + 技术因子。
+    行情同步成功后，独立判断因子表缺口并补齐（因子失败不影响返回结果）。
+    返回: (success: bool, message: str)
+    """
+    success, msg = _sync_market_incremental(fund_code)
+    if success:
+        _sync_factor_incremental(fund_code, datetime.now().strftime('%Y%m%d'))
+    return success, msg
+
+def _sync_market_incremental(fund_code: str) -> tuple[bool, str]:
+    """
+    行情增量同步：从数据库最新日期到今天的行情数据。
     用于巡检时确保数据最新。
     返回: (success: bool, message: str)
     """
@@ -265,7 +395,7 @@ def sync_incremental(fund_code: str) -> tuple[bool, str]:
     
     latest_date = get_latest_trade_date(fund_code)
     
-    logger.info(f"sync_incremental: {fund_code} 今天={today}({weekday_names[weekday]}), DB最新={latest_date}")
+    logger.info(f"_sync_market_incremental: {fund_code} 今天={today}({weekday_names[weekday]}), DB最新={latest_date}")
     
     if latest_date is None:
         return False, (
@@ -288,7 +418,7 @@ def sync_incremental(fund_code: str) -> tuple[bool, str]:
     
     # 从最新日期的下一天开始拉取
     start = (datetime.strptime(latest_date_clean, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
-    logger.info(f"sync_incremental: {fund_code} 增量拉取 {start}~{today}")
+    logger.info(f"_sync_market_incremental: {fund_code} 增量拉取 {start}~{today}")
     
     df, error = fetch_history_data(fund_code, start, today)
     
@@ -303,7 +433,7 @@ def sync_incremental(fund_code: str) -> tuple[bool, str]:
     
     save_daily_data(df)
     msg = f"增量同步成功，新增 {len(df)} 条数据（{df['trade_date'].min()} ~ {df['trade_date'].max()}）"
-    logger.info(f"sync_incremental: {msg}")
+    logger.info(f"_sync_market_incremental: {msg}")
     
     # 防限流
     time.sleep(1)

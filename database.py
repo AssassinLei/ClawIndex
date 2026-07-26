@@ -8,6 +8,37 @@ logger = setup_logger("database")
 
 DB_NAME = "quant_system.db"
 
+# idx_factor_pro 接口输出的全部数值列（除 ts_code/trade_date 外），共 87 列：
+# 行情 9 列 + 技术因子 78 列。建表/写入/读取均以此列表为唯一事实源，
+# data_fetcher 拼接接口 fields 参数时也复用该列表，确保字段一致。
+IDX_FACTOR_COLUMNS = [
+    # 行情
+    'open', 'high', 'low', 'close', 'pre_close', 'change', 'pct_change', 'vol', 'amount',
+    # 技术因子（_bfq 表示不复权）
+    'asi_bfq', 'asit_bfq', 'atr_bfq', 'bbi_bfq',
+    'bias1_bfq', 'bias2_bfq', 'bias3_bfq',
+    'boll_lower_bfq', 'boll_mid_bfq', 'boll_upper_bfq',
+    'brar_ar_bfq', 'brar_br_bfq', 'cci_bfq', 'cr_bfq',
+    'dfma_dif_bfq', 'dfma_difma_bfq',
+    'dmi_adx_bfq', 'dmi_adxr_bfq', 'dmi_mdi_bfq', 'dmi_pdi_bfq',
+    'downdays', 'updays', 'dpo_bfq', 'madpo_bfq',
+    'ema_bfq_5', 'ema_bfq_10', 'ema_bfq_20', 'ema_bfq_30',
+    'ema_bfq_60', 'ema_bfq_90', 'ema_bfq_250',
+    'emv_bfq', 'maemv_bfq', 'expma_12_bfq', 'expma_50_bfq',
+    'kdj_bfq', 'kdj_d_bfq', 'kdj_k_bfq',
+    'ktn_down_bfq', 'ktn_mid_bfq', 'ktn_upper_bfq',
+    'lowdays', 'topdays',
+    'ma_bfq_5', 'ma_bfq_10', 'ma_bfq_20', 'ma_bfq_30',
+    'ma_bfq_60', 'ma_bfq_90', 'ma_bfq_250',
+    'macd_bfq', 'macd_dea_bfq', 'macd_dif_bfq',
+    'mass_bfq', 'ma_mass_bfq', 'mfi_bfq', 'mtm_bfq', 'mtmma_bfq', 'obv_bfq',
+    'psy_bfq', 'psyma_bfq', 'roc_bfq', 'maroc_bfq',
+    'rsi_bfq_6', 'rsi_bfq_12', 'rsi_bfq_24',
+    'taq_down_bfq', 'taq_mid_bfq', 'taq_up_bfq',
+    'trix_bfq', 'trma_bfq', 'vr_bfq', 'wr_bfq', 'wr1_bfq',
+    'xsii_td1_bfq', 'xsii_td2_bfq', 'xsii_td3_bfq', 'xsii_td4_bfq',
+]
+
 
 def safe_float(val):
     """安全转 float，非数值 / NaN / Inf / 空串 → None
@@ -159,6 +190,17 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # 列已存在，忽略
         
+        # 表8：指数技术因子（idx_factor_pro 专业版数据，列结构由 IDX_FACTOR_COLUMNS 驱动）
+        factor_cols_sql = ",\n                ".join(f"{c} REAL" for c in IDX_FACTOR_COLUMNS)
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS idx_factor_data (
+                fund_code TEXT NOT NULL,
+                trade_date DATE NOT NULL,
+                {factor_cols_sql},
+                PRIMARY KEY (fund_code, trade_date)
+            )
+        ''')
+        
         conn.commit()
     finally:
         conn.close()
@@ -188,11 +230,12 @@ def remove_fund(fund_code: str):
         # 必须先删子表（有 FOREIGN KEY 引用 fund_pool），再删主表
         conn.execute("DELETE FROM fund_custom_prompts WHERE fund_code = ?", (fund_code,))
         conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
+        conn.execute("DELETE FROM idx_factor_data WHERE fund_code = ?", (fund_code,))
         conn.execute("DELETE FROM fund_pool WHERE fund_code = ?", (fund_code,))
         conn.commit()
     finally:
         conn.close()
-    logger.info(f"remove_fund: {fund_code}，已清理行情数据及定制提示词")
+    logger.info(f"remove_fund: {fund_code}，已清理行情数据、技术因子及定制提示词")
 
 def get_all_funds() -> List[Dict]:
     conn = get_connection()
@@ -355,6 +398,71 @@ def calculate_percentile(fund_code: str, indicator: str, current_value: float, l
         return round(lower_count / total_count, 4)
     finally:
         conn.close()
+
+# --- 技术因子数据操作 ---
+def save_idx_factor_data(df: pd.DataFrame):
+    """将 idx_factor_pro 拉取的因子数据批量存入 SQLite，遇重复主键则覆盖"""
+    if df.empty:
+        return
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        rows = []
+        for _, row in df.iterrows():
+            rows.append(
+                (row.get('fund_code'), _norm_date(str(row.get('trade_date', ''))))
+                + tuple(safe_float(row.get(c)) for c in IDX_FACTOR_COLUMNS)
+            )
+
+        cols_str = ', '.join(['fund_code', 'trade_date'] + IDX_FACTOR_COLUMNS)
+        placeholders = ', '.join(['?'] * (len(IDX_FACTOR_COLUMNS) + 2))
+        cursor.executemany(
+            f"INSERT OR REPLACE INTO idx_factor_data ({cols_str}) VALUES ({placeholders})",
+            rows
+        )
+
+        conn.commit()
+        logger.info(f"save_idx_factor_data: 写入 {len(rows)} 行技术因子数据")
+    finally:
+        conn.close()
+
+
+def get_latest_factor_trade_date(fund_code: str) -> str:
+    """获取指定标的在因子表中的最新交易日期，用于增量同步判断"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        # 使用 REPLACE 去横线再取 MAX，兼容 YYYYMMDD / YYYY-MM-DD 两种格式
+        cursor.execute(
+            "SELECT MAX(REPLACE(trade_date, '-', '')) FROM idx_factor_data WHERE fund_code = ?",
+            (fund_code,)
+        )
+        result = cursor.fetchone()[0]
+        return str(result) if result is not None else None  # 返回 None 表示无数据
+    finally:
+        conn.close()
+
+
+def get_latest_idx_factor(fund_code: str) -> Dict:
+    """查询指定标的最新一日的全部技术因子数据，供巡检卡片展示"""
+    conn = get_connection()
+    try:
+        cursor = conn.execute("""
+            SELECT *
+            FROM idx_factor_data
+            WHERE fund_code = ?
+            ORDER BY REPLACE(trade_date, '-', '') DESC LIMIT 1
+        """, (fund_code,))
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        result = {c: safe_float(row[c]) for c in IDX_FACTOR_COLUMNS}
+        result['trade_date'] = _norm_date(row['trade_date'])
+        return result
+    finally:
+        conn.close()
+
 
 # --- 行业分类管理 ---
 def save_industry_list(df: pd.DataFrame):

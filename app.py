@@ -5,8 +5,8 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt
-from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, is_trade_day
+from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt
+from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, fetch_index_members, is_trade_day
 from llm_agent import INDICATOR_META, INDICATOR_GROUPS
 from webhook_sender import send_to_all_webhooks
 from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running
@@ -168,6 +168,144 @@ TREND_RANGE_OPTIONS = {
 }
 
 
+# 技术因子展示元数据：(分组名, [(列名, 指标标签, 参数说明)])，列名对应 idx_factor_data 表
+FACTOR_GROUPS = [
+    ("均线类", [
+        ("ma_bfq_5",     "MA5",      "5日简单移动平均"),
+        ("ma_bfq_10",    "MA10",     "10日简单移动平均"),
+        ("ma_bfq_20",    "MA20",     "20日简单移动平均"),
+        ("ma_bfq_30",    "MA30",     "30日简单移动平均"),
+        ("ma_bfq_60",    "MA60",     "60日简单移动平均"),
+        ("ma_bfq_90",    "MA90",     "90日简单移动平均"),
+        ("ma_bfq_250",   "MA250",    "250日简单移动平均（年线）"),
+        ("ema_bfq_5",    "EMA5",     "5日指数移动平均"),
+        ("ema_bfq_10",   "EMA10",    "10日指数移动平均"),
+        ("ema_bfq_20",   "EMA20",    "20日指数移动平均"),
+        ("ema_bfq_30",   "EMA30",    "30日指数移动平均"),
+        ("ema_bfq_60",   "EMA60",    "60日指数移动平均"),
+        ("ema_bfq_90",   "EMA90",    "90日指数移动平均"),
+        ("ema_bfq_250",  "EMA250",   "250日指数移动平均"),
+        ("expma_12_bfq", "EXPMA12",  "EMA指数平均数 N1=12"),
+        ("expma_50_bfq", "EXPMA50",  "EMA指数平均数 N2=50"),
+        ("bbi_bfq",      "BBI",      "多空指标 M=3/6/12/20"),
+    ]),
+    ("趋势类", [
+        ("macd_dif_bfq",   "MACD DIF",  "快慢线差 SHORT=12, LONG=26"),
+        ("macd_dea_bfq",   "MACD DEA",  "DIF的M日平滑 M=9"),
+        ("macd_bfq",       "MACD",      "MACD柱 (DIF-DEA)×2"),
+        ("dmi_pdi_bfq",    "DMI +DI",   "上升方向线 M1=14"),
+        ("dmi_mdi_bfq",    "DMI -DI",   "下降方向线 M1=14"),
+        ("dmi_adx_bfq",    "DMI ADX",   "趋势平均线 M2=6"),
+        ("dmi_adxr_bfq",   "DMI ADXR",  "ADX评估线"),
+        ("trix_bfq",       "TRIX",      "三重指数平滑均线 M1=12"),
+        ("trma_bfq",       "TRMA",      "TRIX的M日均线 M2=20"),
+        ("dpo_bfq",        "DPO",       "区间震荡线 M1=20"),
+        ("madpo_bfq",      "MADPO",     "DPO的平滑线 M2=10"),
+        ("dfma_dif_bfq",   "DMA DIF",   "平行线差 N1=10, N2=50"),
+        ("dfma_difma_bfq", "DMA DIFMA", "DIF的M日均线 M=10"),
+    ]),
+    ("摆动类", [
+        ("kdj_k_bfq",   "KDJ K",   "K值 N=9, M1=3"),
+        ("kdj_d_bfq",   "KDJ D",   "D值 M2=3"),
+        ("kdj_bfq",     "KDJ J",   "J值 3K-2D"),
+        ("rsi_bfq_6",   "RSI6",    "6日相对强弱指标"),
+        ("rsi_bfq_12",  "RSI12",   "12日相对强弱指标"),
+        ("rsi_bfq_24",  "RSI24",   "24日相对强弱指标"),
+        ("wr_bfq",      "W&R",     "威廉指标 N=10"),
+        ("wr1_bfq",     "W&R1",    "威廉指标 N1=6"),
+        ("cci_bfq",     "CCI",     "顺势指标 N=14"),
+        ("bias1_bfq",   "BIAS6",   "乖离率 L1=6"),
+        ("bias2_bfq",   "BIAS12",  "乖离率 L2=12"),
+        ("bias3_bfq",   "BIAS24",  "乖离率 L3=24"),
+        ("roc_bfq",     "ROC",     "变动率指标 N=12"),
+        ("maroc_bfq",   "MAROC",   "ROC的M日均线 M=6"),
+        ("mtm_bfq",     "MTM",     "动量指标 N=12"),
+        ("mtmma_bfq",   "MTMMA",   "MTM的M日均线 M=6"),
+        ("psy_bfq",     "PSY",     "心理线 N=12"),
+        ("psyma_bfq",   "PSYMA",   "PSY的M日均线 M=6"),
+    ]),
+    ("通道类", [
+        ("boll_upper_bfq", "BOLL上轨", "布林带 N=20, P=2"),
+        ("boll_mid_bfq",   "BOLL中轨", "布林带中枢"),
+        ("boll_lower_bfq", "BOLL下轨", "布林带下轨"),
+        ("ktn_upper_bfq",  "KTN上轨",  "肯特纳通道 N=20, ATR=10"),
+        ("ktn_mid_bfq",    "KTN中轨",  "肯特纳通道中枢"),
+        ("ktn_down_bfq",   "KTN下轨",  "肯特纳通道下轨"),
+        ("taq_up_bfq",     "TAQ上轨",  "唐安奇通道(海龟) N=20"),
+        ("taq_mid_bfq",    "TAQ中轨",  "唐安奇通道中枢"),
+        ("taq_down_bfq",   "TAQ下轨",  "唐安奇通道下轨"),
+        ("xsii_td1_bfq",   "XSII TD1", "薛斯通道II N=102, M=7"),
+        ("xsii_td2_bfq",   "XSII TD2", "薛斯通道II"),
+        ("xsii_td3_bfq",   "XSII TD3", "薛斯通道II"),
+        ("xsii_td4_bfq",   "XSII TD4", "薛斯通道II"),
+    ]),
+    ("量能与波动", [
+        ("obv_bfq",     "OBV",     "能量潮指标"),
+        ("vr_bfq",      "VR",      "容量比率 M1=26"),
+        ("mfi_bfq",     "MFI",     "资金流量指标 N=14"),
+        ("atr_bfq",     "ATR",     "真实波动20日均值 N=20"),
+        ("emv_bfq",     "EMV",     "简易波动指标 N=14"),
+        ("maemv_bfq",   "MAEMV",   "EMV的M日均线 M=9"),
+        ("brar_ar_bfq", "BRAR AR", "人气指标 M1=26"),
+        ("brar_br_bfq", "BRAR BR", "意愿指标 M1=26"),
+        ("cr_bfq",      "CR",      "价格动量指标 N=20"),
+        ("mass_bfq",    "MASS",    "梅斯线 N1=9, N2=25"),
+        ("ma_mass_bfq", "MAMASS",  "梅斯线的M日均线 M=6"),
+        ("asi_bfq",     "ASI",     "振动升降指标 M1=26"),
+        ("asit_bfq",    "ASIT",    "ASI的M日均线 M2=10"),
+    ]),
+    ("涨跌统计", [
+        ("updays",   "连涨天数", "连续上涨交易日数"),
+        ("downdays", "连跌天数", "连续下跌交易日数"),
+        ("topdays",  "高点周期", "当前最高价为近N周期内最高"),
+        ("lowdays",  "低点周期", "当前最低价为近N周期内最低"),
+    ]),
+]
+
+
+def render_factor_panel(fund_code: str):
+    """在 popover 内渲染最新一日的技术因子数据，按类别分组展示。"""
+    factor = get_latest_idx_factor(fund_code)
+    if not factor:
+        st.caption("暂无技术因子数据（可能接口无权限或尚未同步）")
+        return
+
+    st.caption(f"交易日期：{factor.get('trade_date', 'N/A')} · 数据来源：Tushare idx_factor_pro（不复权）")
+    for group_label, items in FACTOR_GROUPS:
+        rows = []
+        for col, label, desc in items:
+            val = factor.get(col)
+            rows.append({
+                "指标": label,
+                "数值": f"{val:.3f}" if val is not None else "N/A",
+                "说明": desc,
+            })
+        st.markdown(f"**{group_label}**")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
+@st.dialog("指数成分", width="large")
+def show_index_members(index_code: str, industry_name: str, level: str):
+    """弹窗实时展示指数的成分股列表（每次实时获取，不落库）。"""
+    with st.spinner(f"正在获取 {industry_name} 的成分股..."):
+        df, error = fetch_index_members(index_code, level)
+
+    if error:
+        st.error(f"成分获取失败：{error}")
+        return
+    if df.empty:
+        st.info("该指数暂无成分股数据")
+        return
+
+    st.caption(f"{industry_name} ({index_code}) · 共 {len(df)} 只成分股 · 数据实时获取自 Tushare")
+    display_df = df[['ts_code', 'name', 'in_date', 'l3_name']].copy()
+    display_df['in_date'] = pd.to_datetime(
+        display_df['in_date'], errors='coerce'
+    ).dt.strftime('%Y-%m-%d').fillna('N/A')
+    display_df.columns = ['股票代码', '股票名称', '纳入日期', '三级行业']
+    st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_history_for_trend(fund_code: str) -> pd.DataFrame:
     """加载某标的的全部历史数据（缓存1小时），供趋势图复用。"""
@@ -299,6 +437,11 @@ def render_card_expander(card: dict, expanded: bool = False):
                                 formula = TREND_INDICATORS.get(key_b, (None,None,None,""))[3]
                                 with st.popover("📈", help=f"查看 {label_b} 历史趋势\n\n{formula}"):
                                     render_trend_chart(code, key_b, label_b)
+
+                # 技术因子入口（idx_factor_pro 专业版数据，弹窗展示最新交易日全部因子）
+                with st.popover("🔬 技术因子", use_container_width=True,
+                                help="查看该指数最新交易日的全部技术面因子（MACD/KDJ/RSI/BOLL 等）"):
+                    render_factor_panel(code)
 
             # ===== 右列：操作建议 → 分析 → 置信度 =====
             with col_right:
@@ -455,7 +598,15 @@ if selected_industry:
     # 显示选中的行业信息
     st.sidebar.info(f"已选择: {new_name} ({new_code})\n层级: {level}")
     
-    if st.sidebar.button("添加监控", type="primary"):
+    col_add, col_members = st.sidebar.columns(2)
+    with col_add:
+        add_clicked = st.button("添加监控", type="primary", use_container_width=True)
+    with col_members:
+        # 成分数据变化频繁，点击后弹窗实时拉取，不落库
+        if st.button("成分查询", use_container_width=True):
+            show_index_members(new_code, new_name, level)
+    
+    if add_clicked:
         added = add_fund(new_code, new_name, new_cat[0])
         if not added:
             st.sidebar.warning(f"{new_name} 已在监控池中，无需重复添加")
