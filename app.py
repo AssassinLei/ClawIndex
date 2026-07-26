@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt
+from database import init_db, add_fund, remove_fund, get_all_funds, get_shared_category, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_latest_trade_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_user_setting, set_user_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt, register_user, user_exists
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, fetch_index_members, is_trade_day
 from llm_agent import INDICATOR_META, INDICATOR_GROUPS
 from webhook_sender import send_to_all_webhooks
@@ -106,11 +106,60 @@ st.markdown("""
 init_db()
 
 # 根据配置决定是否启动定时调度器（关闭后不会因为 rerun 自动重启）
+# 注意：必须在登录门之前启动，保证无人登录也能执行定时巡检
 auto_enabled_init = get_setting("scheduler_auto_enabled", "true")
 if auto_enabled_init == "true":
     start_scheduler()
 
-# 初始化行业分类数据（如果数据库为空则自动拉取）
+
+# --- 登录门：未登录时只渲染登录/注册页，不进入主界面 ---
+def _clear_inspection_state():
+    """清理巡检相关会话状态，防止同一浏览器换用户后看到上一用户的巡检卡片"""
+    for key in ("inspection_active", "inspection_fund_list", "inspection_index",
+                "inspection_total", "inspection_cards", "_processed_codes"):
+        st.session_state.pop(key, None)
+
+
+if "username" not in st.session_state:
+    st.markdown("## 👤 用户登录")
+    st.caption("输入用户名进入系统。各用户拥有独立的监控池与推送配置，行情数据与巡检结果全局共享。")
+
+    col_login, col_register = st.columns(2)
+    with col_login:
+        st.subheader("登录", anchor=False)
+        # 用 form 包裹，输入框内回车即可提交登录
+        with st.form("login_form"):
+            login_name = st.text_input("用户名", placeholder="输入已注册的用户名", key="login_input")
+            if st.form_submit_button("登录", type="primary", use_container_width=True):
+                name = login_name.strip()
+                if not name:
+                    st.warning("请输入用户名")
+                elif user_exists(name):
+                    st.session_state.username = name
+                    _clear_inspection_state()
+                    st.rerun()
+                else:
+                    st.warning("用户名不存在，请先在右侧注册")
+    with col_register:
+        st.subheader("注册", anchor=False)
+        # 用 form 包裹，输入框内回车即可提交注册
+        with st.form("register_form"):
+            reg_name = st.text_input("用户名", placeholder="输入名称即可注册", key="register_input")
+            if st.form_submit_button("注册并登录", use_container_width=True):
+                name = reg_name.strip()
+                if not name:
+                    st.warning("用户名不能为空")
+                elif register_user(name):
+                    st.session_state.username = name
+                    _clear_inspection_state()
+                    st.rerun()
+                else:
+                    st.warning(f"用户名「{name}」已存在，请直接登录")
+    st.stop()
+
+username = st.session_state.username
+
+# 初始化行业分类数据（如果数据库为空则自动拉取；置于登录门后，未登录不触发网络请求）
 if get_industry_count() == 0:
     with st.spinner('正在初始化行业分类数据...'):
         success, msg = fetch_industry_classify()
@@ -482,6 +531,14 @@ def render_card_expander(card: dict, expanded: bool = False):
                 else:
                     st.caption("N/A")
 
+# --- 侧边栏：当前用户 ---
+st.sidebar.markdown(f"👤 当前用户：**{username}**")
+if st.sidebar.button("退出登录", use_container_width=True):
+    _clear_inspection_state()
+    st.session_state.pop("username", None)
+    st.rerun()
+st.sidebar.divider()
+
 # --- 侧边栏：巡检进行中提示 ---
 if st.session_state.get("inspection_active", False):
     idx = st.session_state.get("inspection_index", 0)
@@ -607,24 +664,42 @@ if selected_industry:
             show_index_members(new_code, new_name, level)
     
     if add_clicked:
-        added = add_fund(new_code, new_name, new_cat[0])
+        # category 为指数级全局属性：他人已监控时强制沿用已有分类，
+        # 避免同一指数多策略框架导致共享巡检结果互相覆写
+        chosen_cat = new_cat[0]
+        shared_cat = get_shared_category(new_code)
+        if shared_cat is not None and shared_cat != chosen_cat:
+            st.sidebar.info(
+                f"该指数已被其他用户监控，策略分类沿用现有配置："
+                f"{CATEGORY_NAMES.get(shared_cat, shared_cat)}"
+            )
+            chosen_cat = shared_cat
+        added = add_fund(username, new_code, new_name, chosen_cat)
         if not added:
             st.sidebar.warning(f"{new_name} 已在监控池中，无需重复添加")
             st.rerun()
         else:
             st.sidebar.success(f"已添加 {new_name}")
-            # 同步历史数据
-            with st.spinner(f'正在拉取 {new_code} 的近10年历史数据...'):
-                success, msg = sync_all_history(new_code)
-            if success:
-                st.sidebar.success(msg)
+            # 同步历史数据（行情全局共享：他人已同步过则复用，并补齐增量防止陈旧）
+            if get_latest_trade_date(new_code) is not None:
+                with st.spinner('正在校验共享行情数据完整性...'):
+                    inc_ok, inc_msg = sync_incremental(new_code)
+                if inc_ok:
+                    st.sidebar.success(f"行情数据已就绪（共享）：{inc_msg}")
+                else:
+                    st.sidebar.warning(f"行情数据已就绪（共享），但增量补齐失败：{inc_msg}")
             else:
-                st.sidebar.error(f"数据同步失败：{msg}")
+                with st.spinner(f'正在拉取 {new_code} 的近10年历史数据...'):
+                    success, msg = sync_all_history(new_code)
+                if success:
+                    st.sidebar.success(msg)
+                else:
+                    st.sidebar.error(f"数据同步失败：{msg}")
             st.rerun()
 
 st.sidebar.divider()
 st.sidebar.subheader("当前监控列表")
-funds = get_all_funds()
+funds = get_all_funds(username)
 
 if funds:
     df_funds = pd.DataFrame(funds)
@@ -639,7 +714,7 @@ if funds:
     selected_name = st.sidebar.selectbox("选择要删除的指数", list(fund_name_to_code.keys()))
     if st.sidebar.button("删除所选指数"):
         del_code = fund_name_to_code[selected_name]
-        remove_fund(del_code)
+        remove_fund(username, del_code)
         st.sidebar.warning(f"已删除 {selected_name}")
         st.rerun()
 else:
@@ -676,16 +751,16 @@ else:
 st.sidebar.divider()
 st.sidebar.header("📨 消息推送设置")
 
-# 巡检推送开关
-webhook_enabled = get_setting("webhook_inspection_enabled", "false")
+# 巡检推送开关（按用户隔离）
+webhook_enabled = get_user_setting(username, "webhook_inspection_enabled", "false")
 current_enabled = webhook_enabled == "true"
 new_enabled = st.sidebar.toggle(
     "巡检时发送消息推送",
     value=current_enabled,
-    help="开启后，每次巡检将为每个指数向已配置的 webhook 地址发送卡片消息",
+    help="开启后，每次巡检将为每个指数向你配置的 webhook 地址发送卡片消息",
 )
 if new_enabled != current_enabled:
-    set_setting("webhook_inspection_enabled", "true" if new_enabled else "false")
+    set_user_setting(username, "webhook_inspection_enabled", "true" if new_enabled else "false")
     st.rerun()
 
 # Webhook 地址管理
@@ -697,7 +772,7 @@ with st.sidebar.form("add_webhook_form", clear_on_submit=True):
     submitted = st.form_submit_button("添加 Webhook", type="primary")
     if submitted:
         if new_url.strip():
-            added = add_webhook_url(new_url.strip(), new_label.strip())
+            added = add_webhook_url(username, new_url.strip(), new_label.strip())
             if added:
                 st.sidebar.success("已添加 Webhook 地址")
             else:
@@ -706,8 +781,8 @@ with st.sidebar.form("add_webhook_form", clear_on_submit=True):
         else:
             st.sidebar.warning("请输入 Webhook URL")
 
-# 已保存的 webhook 列表
-webhook_urls = get_webhook_urls()
+# 已保存的 webhook 列表（仅当前用户）
+webhook_urls = get_webhook_urls(username)
 if webhook_urls:
     for wh in webhook_urls:
         wh_label = wh.get("label", "") or "未命名"
@@ -720,7 +795,7 @@ if webhook_urls:
             st.caption(f"{display_url}")
         with col2:
             if st.button("🗑️", key=f"del_wh_{wh['id']}", help="删除此 Webhook"):
-                remove_webhook_url(wh["id"])
+                remove_webhook_url(username, wh["id"])
                 st.rerun()
 else:
     st.sidebar.caption("暂无 Webhook 地址，请添加")
@@ -819,9 +894,9 @@ with tab1:
             else:
                 style = ACTION_STYLES.get(action, ACTION_STYLES["持有/观望"])
 
-            # Webhook 推送
+            # Webhook 推送（仅当前用户的开关与地址）
             if new_enabled:
-                wh_urls = get_webhook_urls()
+                wh_urls = get_webhook_urls(username)
                 if wh_urls:
                     send_to_all_webhooks(wh_urls, fund_data)
 

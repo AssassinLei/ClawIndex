@@ -78,6 +78,8 @@ def get_connection():
     conn = sqlite3.connect(DB_NAME)
     # 启用 WAL 模式：读写可并发，提升巡检写入时的查询性能
     conn.execute("PRAGMA journal_mode=WAL")
+    # 多用户并发写入时等待锁最多 5 秒，避免 database is locked
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
@@ -88,14 +90,16 @@ def init_db():
     try:
         cursor = conn.cursor()
         
-        # 表1：基金池
+        # 表1：基金池（多用户：同一指数可被多个用户分别监控）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS fund_pool (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fund_code TEXT UNIQUE NOT NULL,
+                username TEXT NOT NULL,
+                fund_code TEXT NOT NULL,
                 fund_name TEXT NOT NULL,
                 category TEXT NOT NULL, -- wide_base, tech_growth, cycle_mfg, dividend
-                added_date DATE DEFAULT (date('now', 'localtime'))
+                added_date DATE DEFAULT (date('now', 'localtime')),
+                UNIQUE(username, fund_code)
             )
         ''')
         
@@ -155,10 +159,11 @@ def init_db():
             )
         ''')
         
-        # 表5：Webhook 地址配置
+        # 表5：Webhook 地址配置（按用户隔离）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS webhook_urls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
                 url TEXT NOT NULL,
                 label TEXT DEFAULT '',
                 created_at DATE DEFAULT (date('now', 'localtime'))
@@ -173,22 +178,16 @@ def init_db():
             )
         ''')
         
-        # 表7：指数定制提示词
+        # 表7：指数定制提示词（全局共享，不分用户；多用户后 fund_pool 的
+        # fund_code 不再唯一，故不能再外键引用 fund_pool）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS fund_custom_prompts (
                 fund_code TEXT PRIMARY KEY,
                 custom_prompt TEXT NOT NULL DEFAULT '',
                 selected_indicators TEXT NOT NULL DEFAULT '',
-                updated_at DATE DEFAULT (date('now', 'localtime')),
-                FOREIGN KEY (fund_code) REFERENCES fund_pool(fund_code)
+                updated_at DATE DEFAULT (date('now', 'localtime'))
             )
         ''')
-        
-        # 兼容旧表：如果已有 fund_custom_prompts 但缺少 selected_indicators 列
-        try:
-            cursor.execute("ALTER TABLE fund_custom_prompts ADD COLUMN selected_indicators TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass  # 列已存在，忽略
         
         # 表8：指数技术因子（idx_factor_pro 专业版数据，列结构由 IDX_FACTOR_COLUMNS 驱动）
         factor_cols_sql = ",\n                ".join(f"{c} REAL" for c in IDX_FACTOR_COLUMNS)
@@ -201,47 +200,166 @@ def init_db():
             )
         ''')
         
+        # 表9：用户表（无密码，仅用户名标识）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                created_at DATE DEFAULT (date('now', 'localtime'))
+            )
+        ''')
+        
         conn.commit()
     finally:
         conn.close()
     logger.info("数据库初始化完成")
 
-# --- 基金池管理操作 ---
-def add_fund(fund_code: str, fund_name: str, category: str) -> bool:
-    """添加基金到监控池，返回 True 表示新增成功，False 表示已存在"""
+# --- 用户管理 ---
+def register_user(username: str) -> bool:
+    """注册新用户，返回 True 表示成功，False 表示用户名为空或已存在"""
+    username = username.strip()
+    if not username:
+        return False
     conn = get_connection()
     try:
-        conn.execute(
-            "INSERT INTO fund_pool (fund_code, fund_name, category) VALUES (?, ?, ?)",
-            (fund_code, fund_name, category)
-        )
+        conn.execute("INSERT INTO users (username) VALUES (?)", (username,))
         conn.commit()
-        logger.info(f"add_fund: {fund_code} {fund_name} (category={category})")
+        logger.info(f"register_user: {username}")
         return True
     except sqlite3.IntegrityError:
-        logger.warning(f"add_fund: {fund_code} already exists")
+        logger.warning(f"register_user: {username} 已存在")
         return False
     finally:
         conn.close()
 
-def remove_fund(fund_code: str):
+
+def get_all_users() -> List[str]:
+    """获取全部已注册用户名列表（仅供后台调度使用，不得在 UI 展示，避免泄露其他用户名）"""
     conn = get_connection()
     try:
-        # 必须先删子表（有 FOREIGN KEY 引用 fund_pool），再删主表
-        conn.execute("DELETE FROM fund_custom_prompts WHERE fund_code = ?", (fund_code,))
-        conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
-        conn.execute("DELETE FROM idx_factor_data WHERE fund_code = ?", (fund_code,))
-        conn.execute("DELETE FROM fund_pool WHERE fund_code = ?", (fund_code,))
+        cursor = conn.execute("SELECT username FROM users ORDER BY created_at, username")
+        return [row["username"] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def user_exists(username: str) -> bool:
+    """检查用户名是否已注册，供登录校验使用"""
+    username = username.strip()  # 与 register_user 防御口径对齐，不依赖调用方预处理
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+# --- 基金池管理操作 ---
+def get_shared_category(fund_code: str) -> str | None:
+    """查询指数在任意用户监控池中已有的策略分类，无人监控时返回 None。
+
+    category 是指数级全局属性：巡检结果全局共享，同一指数必须在全系统
+    使用同一策略框架，否则不同用户的 AI 分析会互相覆写、推送内容错位。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT category FROM fund_pool WHERE fund_code = ? LIMIT 1", (fund_code,)
+        ).fetchone()
+        return row["category"] if row else None
+    finally:
+        conn.close()
+
+
+def add_fund(username: str, fund_code: str, fund_name: str, category: str) -> bool:
+    """添加基金到指定用户的监控池，返回 True 表示新增成功，False 表示已存在。
+
+    若该指数已被其他用户监控，强制沿用已有 category（指数级全局属性，
+    纵深防御：无论调用方是否已做检查，此处都不会产生分类分歧）。
+    """
+    conn = get_connection()
+    try:
+        # 强制沿用已有分类，保证同一指数全系统只有一个策略框架
+        existing = conn.execute(
+            "SELECT category FROM fund_pool WHERE fund_code = ? LIMIT 1", (fund_code,)
+        ).fetchone()
+        if existing and existing["category"] != category:
+            logger.info(
+                f"add_fund: [{username}] {fund_code} 所选分类 {category} 被覆盖为已有分类 {existing['category']}（指数级全局属性）"
+            )
+            category = existing["category"]
+        conn.execute(
+            "INSERT INTO fund_pool (username, fund_code, fund_name, category) VALUES (?, ?, ?, ?)",
+            (username, fund_code, fund_name, category)
+        )
+        conn.commit()
+        logger.info(f"add_fund: [{username}] {fund_code} {fund_name} (category={category})")
+        return True
+    except sqlite3.IntegrityError:
+        logger.warning(f"add_fund: [{username}] {fund_code} already exists")
+        return False
+    finally:
+        conn.close()
+
+def remove_fund(username: str, fund_code: str):
+    """将指数移出指定用户的监控池；仅当无其他用户监控时才清理共享数据"""
+    conn = get_connection()
+    try:
+        # 1. 删除本用户的监控关系
+        conn.execute("DELETE FROM fund_pool WHERE username = ? AND fund_code = ?", (username, fund_code))
+        # 2. 检查是否仍有其他用户监控该指数
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM fund_pool WHERE fund_code = ?", (fund_code,)
+        ).fetchone()[0]
+        # 3. 无人监控才清理共享的行情/因子/提示词数据（inspection_log 保留为全局历史）
+        if remaining == 0:
+            conn.execute("DELETE FROM fund_custom_prompts WHERE fund_code = ?", (fund_code,))
+            conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
+            conn.execute("DELETE FROM idx_factor_data WHERE fund_code = ?", (fund_code,))
         conn.commit()
     finally:
         conn.close()
-    logger.info(f"remove_fund: {fund_code}，已清理行情数据、技术因子及定制提示词")
+    if remaining == 0:
+        logger.info(f"remove_fund: [{username}] {fund_code}，已无用户监控，行情/因子/提示词已清理")
+    else:
+        logger.info(f"remove_fund: [{username}] {fund_code}，仍有 {remaining} 个用户监控，共享数据保留")
 
-def get_all_funds() -> List[Dict]:
+def get_all_funds(username: str) -> List[Dict]:
+    """获取指定用户的监控池列表"""
     conn = get_connection()
     try:
-        cursor = conn.execute("SELECT * FROM fund_pool")
+        cursor = conn.execute("SELECT * FROM fund_pool WHERE username = ?", (username,))
         return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_distinct_funds() -> List[Dict]:
+    """获取全体用户基金池的并集（按 fund_code 去重），供定时巡检使用。
+
+    category 由 add_fund 强制沿用已有值（指数级全局属性），同一 fund_code
+    各行取值恒一致，MIN 聚合仅为 GROUP BY 语法需要。
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute("""
+            SELECT fund_code, MIN(fund_name) AS fund_name, MIN(category) AS category
+            FROM fund_pool GROUP BY fund_code
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_fund_watchers_map() -> Dict[str, List[str]]:
+    """构建 fund_code → 监控用户名列表 的映射，供定时巡检推送路由（避免循环内 N+1 查询）"""
+    conn = get_connection()
+    try:
+        cursor = conn.execute("SELECT fund_code, username FROM fund_pool")
+        result: Dict[str, List[str]] = {}
+        for row in cursor.fetchall():
+            result.setdefault(row["fund_code"], []).append(row["username"])
+        return result
     finally:
         conn.close()
 
@@ -635,43 +753,48 @@ def get_latest_market_data(fund_code: str) -> Dict:
         conn.close()
 
 # --- Webhook 配置管理 ---
-def get_webhook_urls() -> List[Dict]:
-    """获取所有已保存的 webhook 地址"""
+def get_webhook_urls(username: str) -> List[Dict]:
+    """获取指定用户已保存的 webhook 地址"""
     conn = get_connection()
     try:
-        cursor = conn.execute("SELECT * FROM webhook_urls ORDER BY id")
+        cursor = conn.execute("SELECT * FROM webhook_urls WHERE username = ? ORDER BY id", (username,))
         return [dict(row) for row in cursor.fetchall()]
     finally:
         conn.close()
 
-def add_webhook_url(url: str, label: str = "") -> bool:
-    """添加一条 webhook 地址，返回 True 表示新增成功，False 表示已存在"""
+def add_webhook_url(username: str, url: str, label: str = "") -> bool:
+    """为指定用户添加一条 webhook 地址，返回 True 表示新增成功，False 表示已存在"""
     url = url.strip()
     label = label.strip()
     conn = get_connection()
     try:
-        # 检查是否已存在相同 URL
-        existing = conn.execute("SELECT id FROM webhook_urls WHERE url = ?", (url,)).fetchone()
+        # 检查同一用户下是否已存在相同 URL
+        existing = conn.execute(
+            "SELECT id FROM webhook_urls WHERE username = ? AND url = ?", (username, url)
+        ).fetchone()
         if existing:
-            logger.warning(f"add_webhook_url: URL 已存在, id={existing['id']}")
+            logger.warning(f"add_webhook_url: [{username}] URL 已存在, id={existing['id']}")
             return False
         conn.execute(
-            "INSERT INTO webhook_urls (url, label) VALUES (?, ?)",
-            (url, label)
+            "INSERT INTO webhook_urls (username, url, label) VALUES (?, ?, ?)",
+            (username, url, label)
         )
         conn.commit()
-        logger.info(f"add_webhook_url: {url[:50]}...")
+        logger.info(f"add_webhook_url: [{username}] {url[:50]}...")
         return True
     finally:
         conn.close()
 
-def remove_webhook_url(webhook_id: int):
-    """删除指定 webhook 地址"""
+def remove_webhook_url(username: str, webhook_id: int):
+    """删除指定用户的 webhook 地址（校验归属，防止误删他人配置）"""
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM webhook_urls WHERE id = ?", (webhook_id,))
+        conn.execute(
+            "DELETE FROM webhook_urls WHERE id = ? AND username = ?",
+            (webhook_id, username)
+        )
         conn.commit()
-        logger.info(f"remove_webhook_url: id={webhook_id}")
+        logger.info(f"remove_webhook_url: [{username}] id={webhook_id}")
     finally:
         conn.close()
 
@@ -698,6 +821,17 @@ def set_setting(key: str, value: str):
         logger.info(f"set_setting: {key} = {value}")
     finally:
         conn.close()
+
+
+# --- 用户级设置（命名空间键 key:username，复用 app_settings 表） ---
+def get_user_setting(username: str, key: str, default: str = "") -> str:
+    """读取指定用户的设置，不存在时返回默认值"""
+    return get_setting(f"{key}:{username}", default)
+
+
+def set_user_setting(username: str, key: str, value: str):
+    """写入或更新指定用户的设置"""
+    set_setting(f"{key}:{username}", value)
 
 
 # --- 指数定制提示词管理 ---

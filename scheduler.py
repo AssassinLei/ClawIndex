@@ -13,7 +13,10 @@ from logger import setup_logger
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from database import get_all_funds, get_webhook_urls, get_setting
+from database import (
+    get_distinct_funds, get_fund_watchers_map, get_all_users,
+    get_webhook_urls, get_setting, get_user_setting,
+)
 from data_fetcher import is_trade_day
 from inspection_pipeline import run_single_inspection
 from webhook_sender import send_to_all_webhooks
@@ -38,7 +41,8 @@ def run_scheduled_inspection():
             return
 
         logger.info("=== 定时巡检开始 ===")
-        funds = get_all_funds()
+        # 全体用户基金池并集去重：同一指数每天只巡检一次
+        funds = get_distinct_funds()
         if not funds:
             logger.info("监控池为空，跳过定时巡检")
             return
@@ -48,9 +52,14 @@ def run_scheduled_inspection():
         sync_error_count = 0
         pipeline_error_count = 0
 
-        # 循环外一次性读取 webhook 配置，避免每只标的重复查库
-        _webhook_enabled = get_setting("webhook_inspection_enabled", "false")
-        _wh_urls = get_webhook_urls() if _webhook_enabled == "true" else []
+        # 循环外一次性构建推送路由映射，避免每只标的重复查库：
+        # watchers_map: fund_code → 监控用户列表
+        # user_webhooks: 开启推送的用户 → 其 webhook 列表
+        watchers_map = get_fund_watchers_map()
+        user_webhooks: dict[str, list] = {}
+        for user in get_all_users():
+            if get_user_setting(user, "webhook_inspection_enabled", "false") == "true":
+                user_webhooks[user] = get_webhook_urls(user)
 
         for fund in funds:
             code = fund["fund_code"]
@@ -69,9 +78,17 @@ def run_scheduled_inspection():
                 fund_data = result["fund_data"]
                 ai_report = result["ai_report"]
 
-                # 5. Webhook 推送（使用循环外已读取的配置）
-                if _wh_urls:
-                    send_to_all_webhooks(_wh_urls, fund_data)
+                # 5. Webhook 推送：只推给监控该指数且开启推送的用户（按 url 去重）
+                target_whs = []
+                seen_urls = set()
+                for user in watchers_map.get(code, []):
+                    for wh in user_webhooks.get(user, []):
+                        wh_url = wh.get("url", "")
+                        if wh_url and wh_url not in seen_urls:
+                            seen_urls.add(wh_url)
+                            target_whs.append(wh)
+                if target_whs:
+                    send_to_all_webhooks(target_whs, fund_data)
 
                 success_count += 1
 
