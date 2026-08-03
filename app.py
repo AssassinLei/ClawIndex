@@ -122,7 +122,7 @@ def _clear_inspection_state():
 
 if "username" not in st.session_state:
     st.markdown("## 👤 用户登录")
-    st.caption("输入用户名进入系统。各用户拥有独立的监控池与推送配置，行情数据与巡检结果全局共享。")
+    st.caption("输入用户名进入系统。各用户拥有独立的监控池、推送配置与提示词，行情数据全局共享，巡检结果按用户隔离。")
 
     col_login, col_register = st.columns(2)
     with col_login:
@@ -881,21 +881,22 @@ with tab1:
             processed_codes.add(code)
             st.session_state._processed_codes = processed_codes
 
-            result = run_single_inspection(code, name, cat)
+            result = run_single_inspection(code, name, cat, username)
             fund_data = result["fund_data"]
-            ai_result = result["ai_report"]  # dict: {analysis, advice, confidence}
+            ai_result = result["ai_report"]  # dict: {analysis, advice, confidence[, ai_error]}
 
-            # 确定视觉风格
+            # 确定视觉风格（AI 调用失败时同样降级为异常样式，且不推送）
             has_error = 'error' in fund_data
+            ai_error = ai_result.get('ai_error', False) if isinstance(ai_result, dict) else False
             action = fund_data.get('decision', {}).get('action', '持有/观望')
             confidence = ai_result.get('confidence', 0) if isinstance(ai_result, dict) else 0
-            if has_error:
+            if has_error or ai_error:
                 style = ACTION_STYLES["数据异常"]
             else:
                 style = ACTION_STYLES.get(action, ACTION_STYLES["持有/观望"])
 
-            # Webhook 推送（仅当前用户的开关与地址）
-            if new_enabled:
+            # Webhook 推送（仅当前用户的开关与地址；AI 调用失败时不推送垃圾结果）
+            if new_enabled and not ai_error:
                 wh_urls = get_webhook_urls(username)
                 if wh_urls:
                     send_to_all_webhooks(wh_urls, fund_data)
@@ -911,8 +912,8 @@ with tab1:
                 'border': style['border'],
                 'bg': style['bg'],
                 'label': style['label'],
-                'has_error': has_error,
-                'error_msg': fund_data.get('error', '') if has_error else '',
+                'has_error': has_error or ai_error,
+                'error_msg': fund_data.get('error', '') if has_error else (ai_result.get('analysis', 'AI 调用失败') if ai_error else ''),
                 'indicators': fund_data.get('indicators', {}),
                 'details': fund_data.get('decision', {}).get('details', []),
                 'ai_report': ai_result,
@@ -953,8 +954,8 @@ with tab1:
 with tab2:
     st.subheader("📋 历史巡检记录", anchor=False)
     
-    # 获取所有历史记录
-    all_records = get_inspection_history()
+    # 获取当前用户的历史记录
+    all_records = get_inspection_history(username=username)
     
     if not all_records:
         st.info("暂无巡检记录，请先在「巡检」标签页运行一次分析。")
@@ -1084,7 +1085,7 @@ with tab2:
 
 with tab3:
     st.subheader("📝 定制 AI 分析提示词", anchor=False)
-    st.caption("为每个监控指数编写专属分析框架，AI 将按你的提示词解读估值数据。留空则使用系统默认策略。")
+    st.caption("为每个监控指数编写你的专属分析框架（仅对当前账号生效），AI 将按你的提示词解读估值数据。留空则使用系统默认策略。")
 
     if not funds:
         st.info("监控池为空，请先在左侧「监控池管理」添加指数。")
@@ -1108,10 +1109,10 @@ with tab3:
             name = fund['fund_name']
             cat = fund['category']
 
-            # 当前配置状态
-            current_prompt = get_custom_prompt(code)
+            # 当前配置状态（仅当前用户）
+            current_prompt = get_custom_prompt(username, code)
             if current_prompt:
-                st.success(f"✅ **{name}** 已配置定制提示词")
+                st.success(f"✅ **{name}** 已配置定制提示词（仅本账号）")
             else:
                 st.info(f"⚪ **{name}** 使用系统默认策略（分类: {CATEGORY_NAMES.get(cat, cat)}）")
 
@@ -1122,7 +1123,7 @@ with tab3:
                 height=280,
                 max_chars=2000,
                 placeholder="在此输入专属分析框架，例如：\n该指数属于消费行业，侧重分析 ROE 稳定性和现金流质量...\n\n留空则使用系统默认策略。",
-                key=f"prompt_editor_{code}",
+                key=f"prompt_editor_{username}_{code}",
                 help="提示词将替换 AI 分析中的「估值解读框架」段落。系统红线（只能基于数据解读、不做预测、不改变决策）始终生效。"
             )
 
@@ -1130,12 +1131,12 @@ with tab3:
             st.markdown("**📊 传递给 AI 的指标**")
             st.caption("勾选需要的指标，AI 将只看到选中项。默认仅选 PE、PB。")
 
-            saved_indicators = get_selected_indicators(code)
+            saved_indicators = get_selected_indicators(username, code)
             default_checked = saved_indicators if saved_indicators else ["pe", "pb"]
 
-            if st.button("☑️ 全选", key=f"select_all_{code}", use_container_width=True):
+            if st.button("☑️ 全选", key=f"select_all_{username}_{code}", use_container_width=True):
                 for key in INDICATOR_META:
-                    st.session_state[f"ind_{code}_{key}"] = True
+                    st.session_state[f"ind_{username}_{code}_{key}"] = True
                 st.rerun()
 
             # 按分组展示指标 checkboxes
@@ -1147,7 +1148,7 @@ with tab3:
                     checked = cols[i].checkbox(
                         label,
                         value=(key in default_checked),
-                        key=f"ind_{code}_{key}",
+                        key=f"ind_{username}_{code}_{key}",
                     )
                     if checked:
                         selected_keys.append(key)
@@ -1158,9 +1159,9 @@ with tab3:
 
             col_btn1, col_btn2 = st.columns([1, 1])
             with col_btn1:
-                if st.button("💾 保存提示词", key=f"save_prompt_{code}", type="primary", use_container_width=True):
+                if st.button("💾 保存提示词", key=f"save_prompt_{username}_{code}", type="primary", use_container_width=True):
                     if prompt_text.strip():
-                        upsert_custom_prompt(code, prompt_text.strip(), indicators=selected_keys)
+                        upsert_custom_prompt(username, code, prompt_text.strip(), indicators=selected_keys)
                         st.session_state.prompt_saved_msg = f"已保存 {name} 的定制提示词（{len(selected_keys)} 项指标）"
                         st.rerun()
                     else:
@@ -1168,8 +1169,8 @@ with tab3:
 
             with col_btn2:
                 if current_prompt:
-                    if st.button("🗑️ 重置为默认", key=f"reset_prompt_{code}", use_container_width=True):
-                        delete_custom_prompt(code)
+                    if st.button("🗑️ 重置为默认", key=f"reset_prompt_{username}_{code}", use_container_width=True):
+                        delete_custom_prompt(username, code)
                         st.warning(f"已清除 {name} 的定制提示词，恢复系统默认策略")
                         st.rerun()
 

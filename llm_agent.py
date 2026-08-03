@@ -46,7 +46,7 @@ INDICATOR_GROUPS = [
     ("行情与技术面", ["price", "ma60", "ma120", "amount", "amount_ma20"]),
 ]
 
-# 默认全部指标（向后兼容：未配置指标筛选时使用）
+# 未配置指标筛选时的默认指标（与 UI 默认勾选一致）
 DEFAULT_INDICATORS = ["pe", "pb"]
 
 
@@ -147,7 +147,7 @@ def _parse_ai_json(raw: str) -> dict:
         confidence = max(0, min(100, confidence))  # 钳位 0~100
         return {"analysis": analysis, "advice": advice, "confidence": confidence}
 
-    # L3: 兜底默认值
+    # L3: 兜底默认值（AI 有实质产出仅格式不合规，不属于 AI 失败，不加 ai_error 标记）
     logger.warning(f"_parse_ai_json: JSON 解析失败，使用兜底值。原始输出前200字符: {raw[:200]}")
     return {"analysis": raw, "advice": "持有/观望", "confidence": 0}
 
@@ -187,9 +187,13 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
     参数 custom_prompt: 用户为指数定制的分析框架，注入 System Prompt 作为补充策略。
     参数 selected_indicators: 用户勾选的指标列表，None 表示全部。
 
-    返回: {"analysis": str, "advice": str, "confidence": int}
+    返回: {"analysis": str, "advice": str, "confidence": int}；
+    AI 调用失败（API 异常/空响应）时额外含 "ai_error": True，下游据此跳过入库与推送。
+    注意三类语义：数据异常（fund_data 含 error，仍入库）、AI 调用失败（ai_error，不入库）、
+    JSON 解析兜底（AI 有产出仅格式不合规，照常入库）。
     """
     if "error" in fund_data:
+        # 数据异常短路：属于"数据异常"语义（仍入库），不属于 AI 失败，不加 ai_error 标记
         logger.warning(f"generate_ai_report: 数据异常, 跳过AI调用 - {fund_data['error']}")
         return {
             "analysis": f"数据获取异常：{fund_data['error']}",
@@ -259,36 +263,42 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
             f"--- 结束 ---"
         )
 
-        # 空响应显式告警
+        # 空响应：属于 AI 调用失败，标记 ai_error 供下游跳过入库/推送
         if not raw:
             logger.warning(
                 f"generate_ai_report: {code} AI 返回空内容！"
                 f" finish_reason={finish_reason}"
                 f" (若为 content_filter 则说明 prompt 被安全过滤拦截)"
             )
-            return _parse_ai_json("")
+            return {
+                "analysis": f"AI 返回空内容（finish_reason={finish_reason}，可能被安全过滤拦截）",
+                "advice": "持有/观望",
+                "confidence": 0,
+                "ai_error": True,
+            }
 
         logger.info(f"generate_ai_report: {code} 返回 {raw_len} 字符, finish_reason={finish_reason}")
         return _parse_ai_json(raw)
+    except openai.RateLimitError as e:
+        # 注意：RateLimitError 是 APIError 子类，必须在前否则永远不可达
+        logger.error(f"generate_ai_report: RateLimitError - {e}")
+        return {"analysis": f"AI 接口限流: {str(e)}", "advice": "持有/观望", "confidence": 0, "ai_error": True}
     except openai.APIError as e:
         logger.error(f"generate_ai_report: APIError - {e}")
-        return {"analysis": f"AI 接口调用失败 [{type(e).__name__}]: {str(e)}", "advice": "持有/观望", "confidence": 0}
-    except openai.RateLimitError as e:
-        logger.error(f"generate_ai_report: RateLimitError - {e}")
-        return {"analysis": f"AI 接口限流: {str(e)}", "advice": "持有/观望", "confidence": 0}
+        return {"analysis": f"AI 接口调用失败 [{type(e).__name__}]: {str(e)}", "advice": "持有/观望", "confidence": 0, "ai_error": True}
     except Exception as e:
         logger.error(f"generate_ai_report: 未知异常 - {type(e).__name__}: {e}")
-        return {"analysis": f"AI 报告生成失败 [{type(e).__name__}]: {str(e)}", "advice": "持有/观望", "confidence": 0}
+        return {"analysis": f"AI 报告生成失败 [{type(e).__name__}]: {str(e)}", "advice": "持有/观望", "confidence": 0, "ai_error": True}
 
 
-def generate_ai_report_with_config(fund_data: Dict) -> dict:
+def generate_ai_report_with_config(fund_data: Dict, username: str) -> dict:
     """
-    高层封装：自动从数据库读取该指数的定制提示词与指标勾选配置，
+    高层封装：自动从数据库读取该用户对该指数的定制提示词与指标勾选配置，
     再调用 generate_ai_report。调用方无需关心数据库查询细节。
     """
     code = fund_data.get('fund_code', '')
-    custom_prompt = get_custom_prompt(code)
-    selected_indicators = get_selected_indicators(code) or None
+    custom_prompt = get_custom_prompt(username, code)
+    selected_indicators = get_selected_indicators(username, code) or None
     return generate_ai_report(
         fund_data,
         custom_prompt=custom_prompt,

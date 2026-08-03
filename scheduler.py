@@ -7,6 +7,7 @@ ClawIndex 定时调度模块
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime
 from logger import setup_logger
 
@@ -16,12 +17,17 @@ from apscheduler.triggers.cron import CronTrigger
 from database import (
     get_distinct_funds, get_fund_watchers_map, get_all_users,
     get_webhook_urls, get_setting, get_user_setting,
+    get_prompt_configs_for_users,
 )
 from data_fetcher import is_trade_day
-from inspection_pipeline import run_single_inspection
+from inspection_pipeline import prepare_fund_data, analyze_and_save_for_user
+from llm_agent import generate_ai_report, DEFAULT_INDICATORS
 from webhook_sender import send_to_all_webhooks
 
 logger = setup_logger("scheduler")
+
+# 相邻两次真实 LLM 调用的间隔秒数（防限流，与 data_fetcher 的 Tushare 节流惯例同量级）
+LLM_CALL_INTERVAL = 1.0
 
 _scheduler: BackgroundScheduler | None = None
 _lock = threading.Lock()
@@ -51,6 +57,7 @@ def run_scheduled_inspection():
         success_count = 0
         sync_error_count = 0
         pipeline_error_count = 0
+        ai_fail_count = 0  # AI 调用失败而跳过入库/推送的用户次数
 
         # 循环外一次性构建推送路由映射，避免每只标的重复查库：
         # watchers_map: fund_code → 监控用户列表
@@ -68,28 +75,69 @@ def run_scheduled_inspection():
             logger.info(f"定时巡检: [{success_count + sync_error_count + pipeline_error_count + 1}/{total}] {name} ({code})")
 
             try:
-                result = run_single_inspection(code, name, cat)
-
-                if result["sync_error"]:
-                    logger.warning(f"定时巡检: {name} 同步失败 - {result['sync_error']}")
+                # 1. 同步 + 指标计算（每指数只执行一次）
+                fund_data = prepare_fund_data(code, name, cat)
+                sync_error = fund_data.pop("sync_error", None)
+                if sync_error:
+                    logger.warning(f"定时巡检: {name} 同步失败 - {sync_error}")
                     sync_error_count += 1
                     continue
 
-                fund_data = result["fund_data"]
-                ai_report = result["ai_report"]
+                # 2. 取监控该指数的用户，按提示词配置分组去重（相同配置只调一次 LLM）
+                watchers = watchers_map.get(code, [])
+                configs = get_prompt_configs_for_users(code, watchers)
+                # 签名 (custom_prompt, tuple(sorted(归一化后指标))) → AI 结果缓存；
+                # 未配置与显式勾选默认指标的用户归一化后合并为同一组，避免等效配置重复调用
+                group_cache: dict[tuple, dict] = {}
+                llm_calls = 0
+                # 每指数内已推送的 URL 集合：同一 URL 被多用户配置时只推一次（先到先得）
+                pushed_urls: set[str] = set()
 
-                # 5. Webhook 推送：只推给监控该指数且开启推送的用户（按 url 去重）
-                target_whs = []
-                seen_urls = set()
-                for user in watchers_map.get(code, []):
+                for user in watchers:
+                    custom_prompt, selected_indicators = configs.get(user, (None, []))
+                    # 归一化：空配置与显式勾选默认指标的 Prompt 完全一致，统一按默认指标处理
+                    effective_inds = selected_indicators or DEFAULT_INDICATORS
+                    signature = (custom_prompt, tuple(sorted(effective_inds)))
+                    ai_result = group_cache.get(signature)
+                    if ai_result is None:
+                        ai_result = generate_ai_report(
+                            fund_data,
+                            custom_prompt=custom_prompt,
+                            selected_indicators=effective_inds,
+                        )
+                        # 失败结果（含 ai_error）也写入缓存：同组后续用户不再重复触发注定失败的调用
+                        group_cache[signature] = ai_result
+                        llm_calls += 1
+                        # 防 LLM 限流：仅真实调用后休眠，缓存命中零开销
+                        time.sleep(LLM_CALL_INTERVAL)
+
+                    # 3. 每个用户各自入库（复用同组 AI 结果；AI 失败时 pipeline 层已跳过入库）
+                    user_result = analyze_and_save_for_user(fund_data, user, ai_result=ai_result)
+
+                    # AI 调用失败：不推送垃圾结果，计数后处理下一用户
+                    if user_result.get("ai_error"):
+                        logger.warning(f"定时巡检: {code} [{user}] AI 调用失败，跳过推送")
+                        ai_fail_count += 1
+                        continue
+
+                    # 4. 仅向该用户自己的 webhook 推送其专属结果（跨用户 URL 去重）
+                    target_whs = []
                     for wh in user_webhooks.get(user, []):
                         wh_url = wh.get("url", "")
-                        if wh_url and wh_url not in seen_urls:
-                            seen_urls.add(wh_url)
-                            target_whs.append(wh)
-                if target_whs:
-                    send_to_all_webhooks(target_whs, fund_data)
+                        if not wh_url:
+                            continue
+                        if wh_url in pushed_urls:
+                            logger.info(f"定时巡检: {code} [{user}] 的 webhook 已由其他用户推送过，跳过去重")
+                            continue
+                        pushed_urls.add(wh_url)
+                        target_whs.append(wh)
+                    if target_whs:
+                        send_to_all_webhooks(target_whs, user_result["fund_data"])
 
+                logger.info(
+                    f"定时巡检: {name} ({code}) 完成 - 监控用户 {len(watchers)} 个, "
+                    f"不同配置 {len(group_cache)} 组, LLM 调用 {llm_calls} 次"
+                )
                 success_count += 1
 
             except Exception as e:
@@ -98,10 +146,14 @@ def run_scheduled_inspection():
                 continue
 
         error_count = sync_error_count + pipeline_error_count
-        logger.info(
+        summary = (
             f"=== 定时巡检结束 === 成功 {success_count}, 失败/跳过 {error_count}"
-            f" (同步失败 {sync_error_count}, 流水线异常 {pipeline_error_count})"
+            f" (同步失败 {sync_error_count}, 流水线异常 {pipeline_error_count}, AI 失败 {ai_fail_count} 用户次)"
         )
+        if ai_fail_count > 0:
+            logger.warning(summary + " —— 存在 AI 调用失败，相关用户当日未入库/推送，请检查 API 状态")
+        else:
+            logger.info(summary)
 
 
 def _should_run_today() -> bool:

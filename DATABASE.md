@@ -14,10 +14,10 @@ quant_system.db
 
 系统支持多用户（无密码，用户名标识），共 **9 张表**，数据分为两类归属：
 
-- **用户维度**（按 `username` 隔离）：监控池 `fund_pool`、Webhook 地址 `webhook_urls`、巡检推送开关（`app_settings` 命名空间键）
-- **全局共享**：行情 `daily_market_data`、技术因子 `idx_factor_data`、行业分类 `industry_list`、巡检结果 `inspection_log`、定制提示词 `fund_custom_prompts`、定时巡检总开关
+- **用户维度**（按 `username` 隔离）：监控池 `fund_pool`、Webhook 地址 `webhook_urls`、巡检推送开关（`app_settings` 命名空间键）、定制提示词 `fund_custom_prompts`、巡检结果 `inspection_log`
+- **全局共享**：行情 `daily_market_data`、技术因子 `idx_factor_data`、行业分类 `industry_list`、定时巡检总开关
 
-同一指数可被多个用户分别监控；行情/因子数据只存一份，删除监控时仅当无其他用户监控才清理共享数据。
+同一指数可被多个用户分别监控；行情/因子数据只存一份，删除监控时仅当无其他用户监控才清理共享数据；提示词与巡检结果按用户隔离。
 
 表之间通过 `fund_code` 在业务逻辑上关联，**未定义外键约束**。
 
@@ -97,11 +97,12 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | `level` | TEXT | NOT NULL | 层级：L1 / L2 / L3 |
 | `industry_code` / `is_pub` / `src` | TEXT | 可空 | 行业编码 / 是否发布 / 来源（SW2021） |
 
-### `inspection_log` — 巡检结果记录（全局共享）
+### `inspection_log` — 巡检结果记录（按用户隔离）
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
 | `id` | INTEGER | PRIMARY KEY, AUTOINCREMENT | 自增主键 |
+| `username` | TEXT | NOT NULL | 归属用户 |
 | `fund_code` / `fund_name` | TEXT | NOT NULL | 标的代码 / 名称 |
 | `action` | TEXT | NOT NULL | 操作建议：买入 / 卖出 / 持有观望 / 数据异常 |
 | `ai_report` | TEXT | 可空 | AI 分析文本 |
@@ -111,7 +112,7 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | `ma60` / `ma120` | REAL | 可空 | 60 / 120 日均线 |
 | `amount` / `amount_ma20` | REAL | 可空 | 成交额 / 20 日均成交额 |
 
-`UNIQUE(fund_code, inspect_date)` + `INSERT OR REPLACE`：同一标的同一天巡检结果覆盖更新——这也是"同一指数每天只跑一次 AI"的去重锚点。
+`UNIQUE(username, fund_code, inspect_date)` + `INSERT OR REPLACE`：同一用户同一标的同一天巡检结果覆盖更新。定时巡检中同一指数每天只同步与计算一次，但按用户提示词配置分组分别调用 AI 并入库。
 
 ### `webhook_urls` — Webhook 地址（按用户隔离）
 
@@ -141,14 +142,17 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 
 读写通过 `get_user_setting` / `set_user_setting` 封装。
 
-### `fund_custom_prompts` — 定制提示词（全局共享）
+### `fund_custom_prompts` — 定制提示词（用户专属）
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
-| `fund_code` | TEXT | PRIMARY KEY | 标的代码 |
+| `username` | TEXT | PRIMARY KEY (与 fund_code 联合) | 归属用户 |
+| `fund_code` | TEXT | PRIMARY KEY (与 username 联合) | 标的代码 |
 | `custom_prompt` | TEXT | NOT NULL DEFAULT '' | 定制分析框架（替换 System Prompt 策略段落） |
 | `selected_indicators` | TEXT | NOT NULL DEFAULT '' | 传递给 AI 的指标 key，逗号分隔 |
 | `updated_at` | DATE | DEFAULT 当天本地日期 | 更新时间 |
+
+主键 `(username, fund_code)`：同一指数不同用户各自配置，互不影响。
 
 ---
 
@@ -161,11 +165,11 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | 添加标的 | `app.py` → `add_fund(username, ...)` | `fund_pool` | 同用户重复添加触发唯一约束，静默忽略；他人已监控时强制沿用已有 category |
 | 同步历史数据 | `data_fetcher.py` → `save_daily_data()` / `save_idx_factor_data()` | `daily_market_data` / `idx_factor_data` | 添加标的时拉近 10 年；行情已存在（他人已同步）则跳过全量拉取，改走 `sync_incremental` 补齐增量 |
 | 增量同步 | 巡检流水线 → `sync_incremental()` | 同上 | 每次巡检前补齐 DB 最新日期到今天的缺口（行情与因子独立判断） |
-| 删除标的 | `app.py` → `remove_fund(username, code)` | 多表 | 删本用户监控关系；无其他用户监控才清理共享行情/因子/提示词（巡检记录保留） |
-| 巡检入库 | `inspection_pipeline.py` → `save_inspection_result()` | `inspection_log` | 同标的同日覆盖更新 |
-| 定时巡检 | `scheduler.py` → `get_distinct_funds()` | `fund_pool` | 全用户并集去重，同一指数每天只巡检一次；推送按 `get_fund_watchers_map()` 路由 |
+| 删除标的 | `app.py` → `remove_fund(username, code)` | 多表 | 删本用户监控关系与其专属提示词；无其他用户监控才清理共享行情/因子（巡检记录保留） |
+| 巡检入库 | `inspection_pipeline.py` → `save_inspection_result()` | `inspection_log` | 同用户同标的同日覆盖更新 |
+| 定时巡检 | `scheduler.py` → `get_distinct_funds()` | `fund_pool` | 全用户并集去重，同一指数每天只同步/计算一次；按用户提示词配置分组去重调用 AI，每用户各自入库与推送 |
 | 策略计算 | `strategy_engine.py` | `daily_market_data` | 读最新基本面、近 150 日价格、历史分位 |
-| 提示词配置 | `app.py` tab3 → `upsert_custom_prompt()` | `fund_custom_prompts` | 全局生效，AI 调用时读取 |
+| 提示词配置 | `app.py` tab3 → `upsert_custom_prompt()` | `fund_custom_prompts` | 按用户生效，AI 调用时读取当前用户配置 |
 
 ---
 
@@ -211,7 +215,8 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | `get_webhook_urls(username)` / `add_webhook_url(username, url, label)` / `remove_webhook_url(username, id)` | 用户维度 Webhook 管理（删除校验归属） |
 | `get_setting` / `set_setting` | 全局键值设置 |
 | `get_user_setting` / `set_user_setting` | 用户级设置（命名空间键 `key:username`） |
-| `get_custom_prompt` / `get_selected_indicators` / `upsert_custom_prompt` / `delete_custom_prompt` | 定制提示词管理（全局） |
+| `get_custom_prompt` / `get_selected_indicators` / `upsert_custom_prompt` / `delete_custom_prompt` | 定制提示词管理（用户专属，均以 username + fund_code 定位） |
+| `get_prompt_configs_for_users(fund_code, usernames)` | 批量读取多用户对同一指数的提示词配置，供定时巡检分组去重 |
 | `save_industry_list(df)` / `get_all_industries()` / `get_industry_count()` | 行业分类管理 |
 
 ---
@@ -233,7 +238,7 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 
 ### 1. 无 schema 迁移机制
 
-`init_db()` 只负责「建表」，**不会**自动添加新字段或修改列类型。若调整表结构，需以空库重新部署（或手动 `ALTER TABLE`）。带入旧版单用户库时，`fund_pool` 缺 `username` 列会直接报错暴露，属有意设计。
+`init_db()` 只负责「建表」（`CREATE TABLE IF NOT EXISTS`），**不会**自动添加新字段或修改列类型。若调整表结构，需以空库重新部署（或手动 `ALTER TABLE`）。带入旧版库时，缺失列会直接报错暴露，属有意设计。
 
 ### 2. 行情写入为 upsert
 

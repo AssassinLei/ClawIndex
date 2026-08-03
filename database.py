@@ -139,10 +139,11 @@ def init_db():
             )
         ''')
         
-        # 表4：巡检结果记录
+        # 表4：巡检结果记录（按用户隔离）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS inspection_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
                 fund_code TEXT NOT NULL,
                 fund_name TEXT NOT NULL,
                 action TEXT NOT NULL,
@@ -155,7 +156,7 @@ def init_db():
                 ma120 REAL,
                 amount REAL,
                 amount_ma20 REAL,
-                UNIQUE(fund_code, inspect_date)
+                UNIQUE(username, fund_code, inspect_date)
             )
         ''')
         
@@ -178,14 +179,15 @@ def init_db():
             )
         ''')
         
-        # 表7：指数定制提示词（全局共享，不分用户；多用户后 fund_pool 的
-        # fund_code 不再唯一，故不能再外键引用 fund_pool）
+        # 表7：指数定制提示词（用户专属：同一指数不同用户各自配置）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS fund_custom_prompts (
-                fund_code TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                fund_code TEXT NOT NULL,
                 custom_prompt TEXT NOT NULL DEFAULT '',
                 selected_indicators TEXT NOT NULL DEFAULT '',
-                updated_at DATE DEFAULT (date('now', 'localtime'))
+                updated_at DATE DEFAULT (date('now', 'localtime')),
+                PRIMARY KEY (username, fund_code)
             )
         ''')
         
@@ -212,6 +214,7 @@ def init_db():
     finally:
         conn.close()
     logger.info("数据库初始化完成")
+
 
 # --- 用户管理 ---
 def register_user(username: str) -> bool:
@@ -302,27 +305,27 @@ def add_fund(username: str, fund_code: str, fund_name: str, category: str) -> bo
         conn.close()
 
 def remove_fund(username: str, fund_code: str):
-    """将指数移出指定用户的监控池；仅当无其他用户监控时才清理共享数据"""
+    """将指数移出指定用户的监控池；提示词随本用户删除，行情/因子仅当无人监控时清理"""
     conn = get_connection()
     try:
-        # 1. 删除本用户的监控关系
+        # 1. 删除本用户的监控关系与其专属提示词
         conn.execute("DELETE FROM fund_pool WHERE username = ? AND fund_code = ?", (username, fund_code))
+        conn.execute("DELETE FROM fund_custom_prompts WHERE username = ? AND fund_code = ?", (username, fund_code))
         # 2. 检查是否仍有其他用户监控该指数
         remaining = conn.execute(
             "SELECT COUNT(*) FROM fund_pool WHERE fund_code = ?", (fund_code,)
         ).fetchone()[0]
-        # 3. 无人监控才清理共享的行情/因子/提示词数据（inspection_log 保留为全局历史）
+        # 3. 无人监控才清理共享的行情/因子数据（inspection_log 保留为历史）
         if remaining == 0:
-            conn.execute("DELETE FROM fund_custom_prompts WHERE fund_code = ?", (fund_code,))
             conn.execute("DELETE FROM daily_market_data WHERE fund_code = ?", (fund_code,))
             conn.execute("DELETE FROM idx_factor_data WHERE fund_code = ?", (fund_code,))
         conn.commit()
     finally:
         conn.close()
     if remaining == 0:
-        logger.info(f"remove_fund: [{username}] {fund_code}，已无用户监控，行情/因子/提示词已清理")
+        logger.info(f"remove_fund: [{username}] {fund_code}，已无用户监控，行情/因子已清理（本用户提示词已删除）")
     else:
-        logger.info(f"remove_fund: [{username}] {fund_code}，仍有 {remaining} 个用户监控，共享数据保留")
+        logger.info(f"remove_fund: [{username}] {fund_code}，仍有 {remaining} 个用户监控，共享数据保留（本用户提示词已删除）")
 
 def get_all_funds(username: str) -> List[Dict]:
     """获取指定用户的监控池列表"""
@@ -633,38 +636,38 @@ def get_industry_count() -> int:
     finally:
         conn.close()
 
-def save_inspection_result(fund_code: str, fund_name: str, action: str, ai_report: str = "",
+def save_inspection_result(username: str, fund_code: str, fund_name: str, action: str, ai_report: str = "",
                            pe_percentile: float = None, pb_percentile: float = None,
                            ma60: float = None, ma120: float = None,
                            amount: float = None, amount_ma20: float = None,
                            confidence: int = None):
-    """保存巡检结果（同一标的同一天覆盖更新），含计算指标与AI置信度"""
+    """保存巡检结果（同一用户同一标的同一天覆盖更新），含计算指标与AI置信度"""
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO inspection_log
-                (fund_code, fund_name, action, ai_report, inspect_date,
+                (username, fund_code, fund_name, action, ai_report, inspect_date,
                  pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence)
-            VALUES (?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?)
-        """, (fund_code, fund_name, action, ai_report,
+            VALUES (?, ?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?)
+        """, (username, fund_code, fund_name, action, ai_report,
               pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence))
         conn.commit()
         logger.info(
-            f"save_inspection_result: {fund_code} {fund_name} action={action} "
+            f"save_inspection_result: [{username}] {fund_code} {fund_name} action={action} "
             f"PE%={pe_percentile} PB%={pb_percentile} MA60={ma60} MA120={ma120} confidence={confidence}"
         )
     finally:
         conn.close()
 
-def get_inspection_history(fund_code: str = None, action: str = None,
+def get_inspection_history(username: str, fund_code: str = None, action: str = None,
                            start_date: str = None, end_date: str = None) -> List[Dict]:
-    """查询巡检历史记录，支持多条件筛选，按日期倒序。"""
+    """按用户查询巡检历史记录，支持多条件筛选，按日期倒序。"""
     conn = get_connection()
     try:
-        query = "SELECT * FROM inspection_log WHERE 1=1"
-        params = []
-        
+        query = "SELECT * FROM inspection_log WHERE username = ?"
+        params = [username]
+
         if fund_code:
             query += " AND fund_code = ?"
             params.append(fund_code)
@@ -682,7 +685,7 @@ def get_inspection_history(fund_code: str = None, action: str = None,
         
         cursor = conn.execute(query, params)
         records = [dict(row) for row in cursor.fetchall()]
-        logger.info(f"get_inspection_history: 返回 {len(records)} 条记录")
+        logger.info(f"get_inspection_history: [{username}] 返回 {len(records)} 条记录")
         return records
     finally:
         conn.close()
@@ -834,14 +837,14 @@ def set_user_setting(username: str, key: str, value: str):
     set_setting(f"{key}:{username}", value)
 
 
-# --- 指数定制提示词管理 ---
-def get_custom_prompt(fund_code: str) -> str | None:
-    """获取某个指数的定制提示词，未配置时返回 None"""
+# --- 指数定制提示词管理（用户专属） ---
+def get_custom_prompt(username: str, fund_code: str) -> str | None:
+    """获取指定用户对某个指数的定制提示词，未配置时返回 None"""
     conn = get_connection()
     try:
         cursor = conn.execute(
-            "SELECT custom_prompt FROM fund_custom_prompts WHERE fund_code = ?",
-            (fund_code,)
+            "SELECT custom_prompt FROM fund_custom_prompts WHERE username = ? AND fund_code = ?",
+            (username, fund_code)
         )
         row = cursor.fetchone()
         if row and row["custom_prompt"].strip():
@@ -851,13 +854,13 @@ def get_custom_prompt(fund_code: str) -> str | None:
         conn.close()
 
 
-def get_selected_indicators(fund_code: str) -> list[str]:
-    """获取某个指数已勾选的指标列表，未配置时返回空列表"""
+def get_selected_indicators(username: str, fund_code: str) -> list[str]:
+    """获取指定用户对某个指数已勾选的指标列表，未配置时返回空列表"""
     conn = get_connection()
     try:
         cursor = conn.execute(
-            "SELECT selected_indicators FROM fund_custom_prompts WHERE fund_code = ?",
-            (fund_code,)
+            "SELECT selected_indicators FROM fund_custom_prompts WHERE username = ? AND fund_code = ?",
+            (username, fund_code)
         )
         row = cursor.fetchone()
         if row and row["selected_indicators"].strip():
@@ -867,30 +870,56 @@ def get_selected_indicators(fund_code: str) -> list[str]:
         conn.close()
 
 
-def upsert_custom_prompt(fund_code: str, prompt_text: str, indicators: list[str] | None = None) -> None:
-    """插入或更新指数的定制提示词及选中的指标"""
-    indicators_str = ",".join(indicators) if indicators else ""
+def get_prompt_configs_for_users(fund_code: str, usernames: list[str]) -> dict[str, tuple[str | None, list[str]]]:
+    """批量获取多个用户对同一指数的提示词配置，供定时巡检分组去重。
+
+    返回 {username: (custom_prompt | None, selected_indicators)}，
+    未配置的用户返回 (None, [])。
+    """
+    result: dict[str, tuple[str | None, list[str]]] = {u: (None, []) for u in usernames}
+    if not usernames:
+        return result
     conn = get_connection()
     try:
-        conn.execute(
-            "INSERT OR REPLACE INTO fund_custom_prompts (fund_code, custom_prompt, selected_indicators, updated_at) VALUES (?, ?, ?, date('now', 'localtime'))",
-            (fund_code, prompt_text, indicators_str)
+        placeholders = ",".join("?" for _ in usernames)
+        cursor = conn.execute(
+            f"SELECT username, custom_prompt, selected_indicators FROM fund_custom_prompts "
+            f"WHERE fund_code = ? AND username IN ({placeholders})",
+            (fund_code, *usernames)
         )
-        conn.commit()
-        logger.info(f"upsert_custom_prompt: {fund_code} prompt 已更新 ({len(prompt_text)} 字符, 指标 {len(indicators or [])} 项)")
+        for row in cursor.fetchall():
+            prompt = row["custom_prompt"].strip() or None
+            indicators = [k.strip() for k in row["selected_indicators"].split(",") if k.strip()]
+            result[row["username"]] = (prompt, indicators)
+        return result
     finally:
         conn.close()
 
 
-def delete_custom_prompt(fund_code: str) -> None:
-    """删除指数的定制提示词，恢复使用默认逻辑"""
+def upsert_custom_prompt(username: str, fund_code: str, prompt_text: str, indicators: list[str] | None = None) -> None:
+    """插入或更新指定用户对指数的定制提示词及选中的指标"""
+    indicators_str = ",".join(indicators) if indicators else ""
     conn = get_connection()
     try:
         conn.execute(
-            "DELETE FROM fund_custom_prompts WHERE fund_code = ?",
-            (fund_code,)
+            "INSERT OR REPLACE INTO fund_custom_prompts (username, fund_code, custom_prompt, selected_indicators, updated_at) VALUES (?, ?, ?, ?, date('now', 'localtime'))",
+            (username, fund_code, prompt_text, indicators_str)
         )
         conn.commit()
-        logger.info(f"delete_custom_prompt: {fund_code} prompt 已删除")
+        logger.info(f"upsert_custom_prompt: [{username}] {fund_code} prompt 已更新 ({len(prompt_text)} 字符, 指标 {len(indicators or [])} 项)")
+    finally:
+        conn.close()
+
+
+def delete_custom_prompt(username: str, fund_code: str) -> None:
+    """删除指定用户对指数的定制提示词，恢复使用默认逻辑"""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "DELETE FROM fund_custom_prompts WHERE username = ? AND fund_code = ?",
+            (username, fund_code)
+        )
+        conn.commit()
+        logger.info(f"delete_custom_prompt: [{username}] {fund_code} prompt 已删除")
     finally:
         conn.close()
