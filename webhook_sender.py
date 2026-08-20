@@ -20,6 +20,14 @@ ACTION_LABELS = {
     "数据异常":   "⚠️ 数据异常",
 }
 
+# 仅这些操作建议允许推送 webhook 卡片（用户级开关 webhook_strong_signal_only 控制）
+PUSH_ACTIONS = frozenset({"买入", "卖出"})
+
+
+def is_action_pushable(fund_data: Dict) -> bool:
+    """判断巡检结果是否属于应推送的强信号（decision.action ∈ PUSH_ACTIONS）"""
+    return fund_data.get("decision", {}).get("action", "") in PUSH_ACTIONS
+
 
 def _format_indicator(value, fmt: str = "{:.2f}", fallback: str = "N/A") -> str:
     """安全格式化指标值，None 时返回 fallback"""

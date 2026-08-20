@@ -8,8 +8,8 @@ from pathlib import Path
 from database import init_db, add_fund, remove_fund, get_all_funds, get_shared_category, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_latest_trade_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_user_setting, set_user_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt, register_user, user_exists
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, fetch_index_members, is_trade_day
 from llm_agent import INDICATOR_META, INDICATOR_GROUPS
-from webhook_sender import send_to_all_webhooks
-from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running
+from webhook_sender import send_to_all_webhooks, is_action_pushable
+from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running, update_cron_expression
 from constants import CATEGORY_NAMES
 from inspection_pipeline import run_single_inspection
 from datetime import datetime, timedelta
@@ -729,7 +729,7 @@ auto_current = auto_enabled == "true"
 auto_toggle = st.sidebar.toggle(
     "启用定时自动巡检",
     value=auto_current,
-    help="每个交易日 19:30 自动执行巡检并通过 webhook 推送结果",
+    help="按配置的 Cron 表达式自动执行巡检并通过 webhook 推送结果",
 )
 if auto_toggle != auto_current:
     set_setting("scheduler_auto_enabled", "true" if auto_toggle else "false")
@@ -739,11 +739,29 @@ if auto_toggle != auto_current:
         stop_scheduler()
     st.rerun()
 
+# Cron 调度表达式配置（全局）
+cron_current = get_setting("scheduler_cron_expr", "30 19 * * 1-5")
+with st.sidebar.form("cron_form", clear_on_submit=False):
+    cron_input = st.text_input(
+        "调度时间（标准 5 字段 Cron）",
+        value=cron_current,
+        key="cron_expr_input",
+        help="格式：分 时 日 月 周。默认 30 19 * * 1-5 = 工作日 19:30；周字段 0=周一…6=周日（如周二、周四=1,3），也可用英文缩写 tue,thu。执行前仍会二次校验交易日",
+    )
+    if st.form_submit_button("保存调度时间"):
+        ok, msg = update_cron_expression(cron_input)
+        if ok:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.error(msg)
+            st.session_state["cron_expr_input"] = cron_current   # 非法时不生效，回显旧值
+        st.rerun()
+
 if is_scheduler_running():
     next_time = get_next_run_time()
     if next_time:
         st.sidebar.caption(f"下一次执行: {next_time}")
-    st.sidebar.caption("调度时段: 工作日 19:30")
+    st.sidebar.caption(f"调度表达式: {cron_current}")
 else:
     st.sidebar.caption("调度器未运行")
 
@@ -761,6 +779,18 @@ new_enabled = st.sidebar.toggle(
 )
 if new_enabled != current_enabled:
     set_user_setting(username, "webhook_inspection_enabled", "true" if new_enabled else "false")
+    st.rerun()
+
+# 强信号过滤开关（按用户隔离；仅影响推送，巡检结果一律照常入库）
+strong_only = get_user_setting(username, "webhook_strong_signal_only", "true")
+current_strong = strong_only == "true"
+new_strong = st.sidebar.toggle(
+    "仅推送买入/卖出建议",
+    value=current_strong,
+    help="开启后，仅当 AI 建议为「买入」或「卖出」时推送卡片；「持有/观望」「数据异常」仍照常入库但不推送",
+)
+if new_strong != current_strong:
+    set_user_setting(username, "webhook_strong_signal_only", "true" if new_strong else "false")
     st.rerun()
 
 # Webhook 地址管理
@@ -895,8 +925,8 @@ with tab1:
             else:
                 style = ACTION_STYLES.get(action, ACTION_STYLES["持有/观望"])
 
-            # Webhook 推送（仅当前用户的开关与地址；AI 调用失败时不推送垃圾结果）
-            if new_enabled and not ai_error:
+            # Webhook 推送（仅当前用户的开关与地址；AI 调用失败不推送；强信号过滤由用户开关控制）
+            if new_enabled and not ai_error and (not new_strong or is_action_pushable(fund_data)):
                 wh_urls = get_webhook_urls(username)
                 if wh_urls:
                     send_to_all_webhooks(wh_urls, fund_data)

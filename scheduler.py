@@ -1,6 +1,6 @@
 """
 ClawIndex 定时调度模块
-- 每个交易日 19:30 自动执行巡检
+- 按全局配置的 Cron 表达式自动执行巡检（默认 30 19 * * 1-5 = 工作日 19:30）
 - 复用现有流水线：同步 → 策略 → AI → 入库 → Webhook
 - 交易日历二次确认，跳过节假日
 """
@@ -16,18 +16,29 @@ from apscheduler.triggers.cron import CronTrigger
 
 from database import (
     get_distinct_funds, get_fund_watchers_map, get_all_users,
-    get_webhook_urls, get_setting, get_user_setting,
+    get_webhook_urls, get_setting, set_setting, get_user_setting,
     get_prompt_configs_for_users,
 )
 from data_fetcher import is_trade_day
 from inspection_pipeline import prepare_fund_data, analyze_and_save_for_user
 from llm_agent import generate_ai_report, DEFAULT_INDICATORS
-from webhook_sender import send_to_all_webhooks
+from webhook_sender import send_to_all_webhooks, is_action_pushable
 
 logger = setup_logger("scheduler")
 
 # 相邻两次真实 LLM 调用的间隔秒数（防限流，与 data_fetcher 的 Tushare 节流惯例同量级）
 LLM_CALL_INTERVAL = 1.0
+
+DEFAULT_CRON_EXPR = "30 19 * * 1-5"   # 等价原"工作日 19:30"（标准 cron 周字段 1-5=周一~周五）
+CRON_SETTING_KEY = "scheduler_cron_expr"
+
+
+def parse_cron_expr(expr: str) -> CronTrigger | None:
+    """解析标准 5 字段 cron 表达式；非法返回 None（不抛异常，便于调用方与 UI 复用）"""
+    try:
+        return CronTrigger.from_crontab(expr.strip(), timezone="Asia/Shanghai")
+    except (ValueError, TypeError):
+        return None
 
 _scheduler: BackgroundScheduler | None = None
 _lock = threading.Lock()
@@ -64,9 +75,11 @@ def run_scheduled_inspection():
         # user_webhooks: 开启推送的用户 → 其 webhook 列表
         watchers_map = get_fund_watchers_map()
         user_webhooks: dict[str, list] = {}
+        user_action_filter: dict[str, bool] = {}   # 需求1: 用户级过滤开关, 预构建读取, 热循环零 DB 开销
         for user in get_all_users():
             if get_user_setting(user, "webhook_inspection_enabled", "false") == "true":
                 user_webhooks[user] = get_webhook_urls(user)
+                user_action_filter[user] = get_user_setting(user, "webhook_strong_signal_only", "true") == "true"
 
         for fund in funds:
             code = fund["fund_code"]
@@ -120,6 +133,12 @@ def run_scheduled_inspection():
                         ai_fail_count += 1
                         continue
 
+                    # 需求1: 仅推送买入/卖出强信号（用户级开关，默认开启）。必须置于 pushed_urls 去重之前：
+                    # 被过滤用户不占用 URL 去重名额，避免同 URL 其他用户的买入/卖出信号被误跳过
+                    if user_action_filter.get(user, True) and not is_action_pushable(user_result["fund_data"]):
+                        logger.info(f"定时巡检: {code} [{user}] 建议非买入/卖出，按过滤开关跳过推送")
+                        continue
+
                     # 4. 仅向该用户自己的 webhook 推送其专属结果（跨用户 URL 去重）
                     target_whs = []
                     for wh in user_webhooks.get(user, []):
@@ -169,39 +188,62 @@ def _should_run_today() -> bool:
 def start_scheduler():
     """
     启动定时调度器（仅首次调用生效，防重复）。
-    每个交易日 19:30 执行。
+    按全局 Cron 表达式调度，执行前走交易日历二次确认。
     """
     global _scheduler
 
-    if _scheduler is not None:
-        return  # 已启动
+    with _lock:
+        if _scheduler is not None:
+            return  # 已启动
 
-    _scheduler = BackgroundScheduler(
-        daemon=True,
-        timezone="Asia/Shanghai",
-    )
+        _scheduler = BackgroundScheduler(
+            daemon=True,
+            timezone="Asia/Shanghai",
+        )
 
-    # 周一到周五 19:30，执行前走交易日历二次确认
-    _scheduler.add_job(
-        func=lambda: _should_run_today() and run_scheduled_inspection(),
-        trigger=CronTrigger(day_of_week="mon-fri", hour=19, minute=30),
-        id="clawindex_daily_inspection",
-        name="ClawIndex 每日巡检",
-        max_instances=1,          # 禁止并发
-        coalesce=True,             # 积压时合并执行
-    )
+        cron_expr = get_setting(CRON_SETTING_KEY, DEFAULT_CRON_EXPR)
+        trigger = parse_cron_expr(cron_expr)
+        if trigger is None:
+            # 防御性回退：数据库被手改坏时保证调度器永不因坏配置挂起
+            logger.warning(f"scheduler: cron 表达式无效 ({cron_expr!r})，回退默认 {DEFAULT_CRON_EXPR}")
+            trigger = CronTrigger.from_crontab(DEFAULT_CRON_EXPR, timezone="Asia/Shanghai")
 
-    _scheduler.start()
-    logger.info("定时调度器已启动: 每个交易日 19:30 自动巡检")
+        _scheduler.add_job(
+            func=lambda: _should_run_today() and run_scheduled_inspection(),
+            trigger=trigger,
+            id="clawindex_daily_inspection",
+            name="ClawIndex 每日巡检",
+            max_instances=1,          # 禁止并发
+            coalesce=True,             # 积压时合并执行
+        )
+
+        _scheduler.start()
+        logger.info(f"定时调度器已启动: cron={cron_expr}（执行前仍走交易日历二次确认）")
 
 
 def stop_scheduler():
     """关闭定时调度器"""
     global _scheduler
-    if _scheduler is not None:
-        _scheduler.shutdown(wait=False)
-        _scheduler = None
-        logger.info("定时调度器已停止")
+    with _lock:
+        if _scheduler is not None:
+            _scheduler.shutdown(wait=False)
+            _scheduler = None
+            logger.info("定时调度器已停止")
+
+
+def update_cron_expression(expr: str) -> tuple[bool, str]:
+    """校验并应用新的调度 cron 表达式；非法时返回 (False, 错误信息)，不落库、不影响现有调度。
+
+    注意：本函数不持锁（Lock 非可重入），通过 stop/start 各自内部加锁保证安全。
+    """
+    expr = expr.strip()
+    if parse_cron_expr(expr) is None:
+        return False, f"Cron 表达式无效（示例：30 19 * * 1-5）：{expr!r}"
+    set_setting(CRON_SETTING_KEY, expr)
+    if _scheduler is not None:   # 仅运行中重启；未运行则下次开启时生效
+        stop_scheduler()
+        start_scheduler()
+    return True, f"调度时间已更新为 {expr}（{'已生效' if _scheduler is not None else '调度器未运行，将在开启后生效'}）"
 
 
 def get_next_run_time() -> str | None:

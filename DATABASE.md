@@ -138,7 +138,9 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | 键 | 语义 |
 |----|------|
 | `scheduler_auto_enabled` | 定时巡检总开关（全局，不带用户后缀） |
+| `scheduler_cron_expr` | 定时巡检 cron 表达式（全局，标准 5 字段，默认 `30 19 * * 1-5`；周字段 0=周一…6=周日，可用英文缩写如 tue,thu） |
 | `webhook_inspection_enabled:{username}` | 该用户的巡检推送开关 |
+| `webhook_strong_signal_only:{username}` | 该用户是否仅推送买入/卖出强信号（默认开启） |
 
 读写通过 `get_user_setting` / `set_user_setting` 封装。
 
