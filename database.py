@@ -9,11 +9,13 @@ logger = setup_logger("database")
 DB_NAME = "quant_system.db"
 
 # idx_factor_pro 接口输出的全部数值列（除 ts_code/trade_date 外），共 87 列：
-# 行情 9 列 + 技术因子 78 列。建表/写入/读取均以此列表为唯一事实源，
+# 行情 9 列 + 技术因子 78 列。建表/写入/读取均以 IDX_FACTOR_COLUMNS 为唯一事实源，
 # data_fetcher 拼接接口 fields 参数时也复用该列表，确保字段一致。
-IDX_FACTOR_COLUMNS = [
-    # 行情
+# 拆分为行情/技术两段：并入 indicators 时只取技术列，避免 amount 等行情列覆盖既有指标键。
+IDX_FACTOR_MARKET_COLUMNS = [
     'open', 'high', 'low', 'close', 'pre_close', 'change', 'pct_change', 'vol', 'amount',
+]
+IDX_FACTOR_TECH_COLUMNS = [
     # 技术因子（_bfq 表示不复权）
     'asi_bfq', 'asit_bfq', 'atr_bfq', 'bbi_bfq',
     'bias1_bfq', 'bias2_bfq', 'bias3_bfq',
@@ -38,6 +40,7 @@ IDX_FACTOR_COLUMNS = [
     'trix_bfq', 'trma_bfq', 'vr_bfq', 'wr_bfq', 'wr1_bfq',
     'xsii_td1_bfq', 'xsii_td2_bfq', 'xsii_td3_bfq', 'xsii_td4_bfq',
 ]
+IDX_FACTOR_COLUMNS = IDX_FACTOR_MARKET_COLUMNS + IDX_FACTOR_TECH_COLUMNS
 
 
 def safe_float(val):
@@ -575,6 +578,30 @@ def get_latest_idx_factor(fund_code: str) -> Dict:
             WHERE fund_code = ?
             ORDER BY REPLACE(trade_date, '-', '') DESC LIMIT 1
         """, (fund_code,))
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        result = {c: safe_float(row[c]) for c in IDX_FACTOR_COLUMNS}
+        result['trade_date'] = _norm_date(row['trade_date'])
+        return result
+    finally:
+        conn.close()
+
+
+def get_idx_factor_for_date(fund_code: str, trade_date: str) -> Dict:
+    """查询指定标的在某日的全部技术因子数据，供历史页回溯当日因子。
+
+    兼容数据库中 YYYYMMDD 和 YYYY-MM-DD 两种日期格式；无匹配时返回空 dict，
+    由调用方决定是否回退到最新可用数据。
+    """
+    conn = get_connection()
+    try:
+        normalized = _norm_date(trade_date)
+        cursor = conn.execute("""
+            SELECT *
+            FROM idx_factor_data
+            WHERE fund_code = ? AND REPLACE(trade_date, '-', '') = REPLACE(?, '-', '')
+        """, (fund_code, normalized))
         row = cursor.fetchone()
         if not row:
             return {}

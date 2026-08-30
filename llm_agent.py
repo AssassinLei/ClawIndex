@@ -48,6 +48,146 @@ INDICATOR_GROUPS = [
     ("行情与技术面", ["price", "ma60", "ma120", "amount", "amount_ma20"]),
 ]
 
+# 技术因子元数据（idx_factor_pro 78 项，单一事实源）：
+# 提示词勾选 UI、user_prompt 渲染、因子面板展示共用；列名对应 idx_factor_data 表
+FACTOR_GROUPS: list = [
+    ("均线类", [
+        "ma_bfq_5", "ma_bfq_10", "ma_bfq_20", "ma_bfq_30",
+        "ma_bfq_60", "ma_bfq_90", "ma_bfq_250",
+        "ema_bfq_5", "ema_bfq_10", "ema_bfq_20", "ema_bfq_30",
+        "ema_bfq_60", "ema_bfq_90", "ema_bfq_250",
+        "expma_12_bfq", "expma_50_bfq", "bbi_bfq",
+    ]),
+    ("趋势类", [
+        "macd_dif_bfq", "macd_dea_bfq", "macd_bfq",
+        "dmi_pdi_bfq", "dmi_mdi_bfq", "dmi_adx_bfq", "dmi_adxr_bfq",
+        "trix_bfq", "trma_bfq", "dpo_bfq", "madpo_bfq",
+        "dfma_dif_bfq", "dfma_difma_bfq",
+    ]),
+    ("摆动类", [
+        "kdj_k_bfq", "kdj_d_bfq", "kdj_bfq",
+        "rsi_bfq_6", "rsi_bfq_12", "rsi_bfq_24",
+        "wr_bfq", "wr1_bfq", "cci_bfq",
+        "bias1_bfq", "bias2_bfq", "bias3_bfq",
+        "roc_bfq", "maroc_bfq", "mtm_bfq", "mtmma_bfq",
+        "psy_bfq", "psyma_bfq",
+    ]),
+    ("通道类", [
+        "boll_upper_bfq", "boll_mid_bfq", "boll_lower_bfq",
+        "ktn_upper_bfq", "ktn_mid_bfq", "ktn_down_bfq",
+        "taq_up_bfq", "taq_mid_bfq", "taq_down_bfq",
+        "xsii_td1_bfq", "xsii_td2_bfq", "xsii_td3_bfq", "xsii_td4_bfq",
+    ]),
+    ("量能与波动", [
+        "obv_bfq", "vr_bfq", "mfi_bfq", "atr_bfq", "emv_bfq", "maemv_bfq",
+        "brar_ar_bfq", "brar_br_bfq", "cr_bfq",
+        "mass_bfq", "ma_mass_bfq", "asi_bfq", "asit_bfq",
+    ]),
+    ("涨跌统计", ["updays", "downdays", "topdays", "lowdays"]),
+]
+
+FACTOR_LABELS: dict = {
+    "ma_bfq_5": "MA5", "ma_bfq_10": "MA10", "ma_bfq_20": "MA20", "ma_bfq_30": "MA30",
+    "ma_bfq_60": "MA60", "ma_bfq_90": "MA90", "ma_bfq_250": "MA250",
+    "ema_bfq_5": "EMA5", "ema_bfq_10": "EMA10", "ema_bfq_20": "EMA20", "ema_bfq_30": "EMA30",
+    "ema_bfq_60": "EMA60", "ema_bfq_90": "EMA90", "ema_bfq_250": "EMA250",
+    "expma_12_bfq": "EXPMA12", "expma_50_bfq": "EXPMA50", "bbi_bfq": "BBI",
+    "macd_dif_bfq": "MACD DIF", "macd_dea_bfq": "MACD DEA", "macd_bfq": "MACD",
+    "dmi_pdi_bfq": "DMI +DI", "dmi_mdi_bfq": "DMI -DI", "dmi_adx_bfq": "DMI ADX", "dmi_adxr_bfq": "DMI ADXR",
+    "trix_bfq": "TRIX", "trma_bfq": "TRMA", "dpo_bfq": "DPO", "madpo_bfq": "MADPO",
+    "dfma_dif_bfq": "DMA DIF", "dfma_difma_bfq": "DMA DIFMA",
+    "kdj_k_bfq": "KDJ K", "kdj_d_bfq": "KDJ D", "kdj_bfq": "KDJ J",
+    "rsi_bfq_6": "RSI6", "rsi_bfq_12": "RSI12", "rsi_bfq_24": "RSI24",
+    "wr_bfq": "W&R", "wr1_bfq": "W&R1", "cci_bfq": "CCI",
+    "bias1_bfq": "BIAS6", "bias2_bfq": "BIAS12", "bias3_bfq": "BIAS24",
+    "roc_bfq": "ROC", "maroc_bfq": "MAROC", "mtm_bfq": "MTM", "mtmma_bfq": "MTMMA",
+    "psy_bfq": "PSY", "psyma_bfq": "PSYMA",
+    "boll_upper_bfq": "BOLL上轨", "boll_mid_bfq": "BOLL中轨", "boll_lower_bfq": "BOLL下轨",
+    "ktn_upper_bfq": "KTN上轨", "ktn_mid_bfq": "KTN中轨", "ktn_down_bfq": "KTN下轨",
+    "taq_up_bfq": "TAQ上轨", "taq_mid_bfq": "TAQ中轨", "taq_down_bfq": "TAQ下轨",
+    "xsii_td1_bfq": "XSII TD1", "xsii_td2_bfq": "XSII TD2", "xsii_td3_bfq": "XSII TD3", "xsii_td4_bfq": "XSII TD4",
+    "obv_bfq": "OBV", "vr_bfq": "VR", "mfi_bfq": "MFI", "atr_bfq": "ATR",
+    "emv_bfq": "EMV", "maemv_bfq": "MAEMV", "brar_ar_bfq": "BRAR AR", "brar_br_bfq": "BRAR BR",
+    "cr_bfq": "CR", "mass_bfq": "MASS", "ma_mass_bfq": "MAMASS",
+    "asi_bfq": "ASI", "asit_bfq": "ASIT",
+    "updays": "连涨天数", "downdays": "连跌天数", "topdays": "高点周期", "lowdays": "低点周期",
+}
+
+# 技术因子简洁中文名（选择界面 checkbox label 展示用；与 LABELS 相同时不重复显示缩写）
+FACTOR_CN: dict = {
+    "ma_bfq_5": "5日均线", "ma_bfq_10": "10日均线", "ma_bfq_20": "20日均线", "ma_bfq_30": "30日均线",
+    "ma_bfq_60": "60日均线", "ma_bfq_90": "90日均线", "ma_bfq_250": "250日均线",
+    "ema_bfq_5": "5日指数均线", "ema_bfq_10": "10日指数均线", "ema_bfq_20": "20日指数均线", "ema_bfq_30": "30日指数均线",
+    "ema_bfq_60": "60日指数均线", "ema_bfq_90": "90日指数均线", "ema_bfq_250": "250日指数均线",
+    "expma_12_bfq": "12日指数平均数", "expma_50_bfq": "50日指数平均数", "bbi_bfq": "多空指标",
+    "macd_dif_bfq": "快慢线差", "macd_dea_bfq": "DIF平滑线", "macd_bfq": "MACD柱",
+    "dmi_pdi_bfq": "上升方向线", "dmi_mdi_bfq": "下降方向线", "dmi_adx_bfq": "趋势强度", "dmi_adxr_bfq": "趋势评估线",
+    "trix_bfq": "三重指数平滑", "trma_bfq": "TRIX均线", "dpo_bfq": "区间震荡线", "madpo_bfq": "DPO平滑线",
+    "dfma_dif_bfq": "平行线差", "dfma_difma_bfq": "DMA均线",
+    "kdj_k_bfq": "K值", "kdj_d_bfq": "D值", "kdj_bfq": "J值",
+    "rsi_bfq_6": "6日相对强弱", "rsi_bfq_12": "12日相对强弱", "rsi_bfq_24": "24日相对强弱",
+    "wr_bfq": "威廉指标", "wr1_bfq": "6日威廉指标", "cci_bfq": "顺势指标",
+    "bias1_bfq": "6日乖离率", "bias2_bfq": "12日乖离率", "bias3_bfq": "24日乖离率",
+    "roc_bfq": "变动率", "maroc_bfq": "ROC均线", "mtm_bfq": "动量指标", "mtmma_bfq": "MTM均线",
+    "psy_bfq": "心理线", "psyma_bfq": "PSY均线",
+    "boll_upper_bfq": "布林上轨", "boll_mid_bfq": "布林中轨", "boll_lower_bfq": "布林下轨",
+    "ktn_upper_bfq": "肯特纳上轨", "ktn_mid_bfq": "肯特纳中轨", "ktn_down_bfq": "肯特纳下轨",
+    "taq_up_bfq": "唐安奇上轨", "taq_mid_bfq": "唐安奇中轨", "taq_down_bfq": "唐安奇下轨",
+    "xsii_td1_bfq": "薛斯通道一", "xsii_td2_bfq": "薛斯通道二", "xsii_td3_bfq": "薛斯通道三", "xsii_td4_bfq": "薛斯通道四",
+    "obv_bfq": "能量潮", "vr_bfq": "容量比率", "mfi_bfq": "资金流量", "atr_bfq": "真实波幅",
+    "emv_bfq": "简易波动", "maemv_bfq": "EMV均线", "brar_ar_bfq": "人气指标", "brar_br_bfq": "意愿指标",
+    "cr_bfq": "价格动量", "mass_bfq": "梅斯线", "ma_mass_bfq": "梅斯线均线",
+    "asi_bfq": "振动升降", "asit_bfq": "ASI均线",
+    "updays": "连涨天数", "downdays": "连跌天数", "topdays": "高点周期", "lowdays": "低点周期",
+}
+
+FACTOR_DESC: dict = {
+    "ma_bfq_5": "5日简单移动平均", "ma_bfq_10": "10日简单移动平均", "ma_bfq_20": "20日简单移动平均",
+    "ma_bfq_30": "30日简单移动平均", "ma_bfq_60": "60日简单移动平均", "ma_bfq_90": "90日简单移动平均",
+    "ma_bfq_250": "250日简单移动平均（年线）",
+    "ema_bfq_5": "5日指数移动平均", "ema_bfq_10": "10日指数移动平均", "ema_bfq_20": "20日指数移动平均",
+    "ema_bfq_30": "30日指数移动平均", "ema_bfq_60": "60日指数移动平均", "ema_bfq_90": "90日指数移动平均",
+    "ema_bfq_250": "250日指数移动平均",
+    "expma_12_bfq": "EMA指数平均数 N1=12", "expma_50_bfq": "EMA指数平均数 N2=50",
+    "bbi_bfq": "多空指标 M=3/6/12/20",
+    "macd_dif_bfq": "快慢线差 SHORT=12, LONG=26", "macd_dea_bfq": "DIF的M日平滑 M=9", "macd_bfq": "MACD柱 (DIF-DEA)×2",
+    "dmi_pdi_bfq": "上升方向线 M1=14", "dmi_mdi_bfq": "下降方向线 M1=14", "dmi_adx_bfq": "趋势平均线 M2=6", "dmi_adxr_bfq": "ADX评估线",
+    "trix_bfq": "三重指数平滑均线 M1=12", "trma_bfq": "TRIX的M日均线 M2=20",
+    "dpo_bfq": "区间震荡线 M1=20", "madpo_bfq": "DPO的平滑线 M2=10",
+    "dfma_dif_bfq": "平行线差 N1=10, N2=50", "dfma_difma_bfq": "DIF的M日均线 M=10",
+    "kdj_k_bfq": "K值 N=9, M1=3", "kdj_d_bfq": "D值 M2=3", "kdj_bfq": "J值 3K-2D",
+    "rsi_bfq_6": "6日相对强弱指标", "rsi_bfq_12": "12日相对强弱指标", "rsi_bfq_24": "24日相对强弱指标",
+    "wr_bfq": "威廉指标 N=10", "wr1_bfq": "威廉指标 N1=6", "cci_bfq": "顺势指标 N=14",
+    "bias1_bfq": "乖离率 L1=6", "bias2_bfq": "乖离率 L2=12", "bias3_bfq": "乖离率 L3=24",
+    "roc_bfq": "变动率指标 N=12", "maroc_bfq": "ROC的M日均线 M=6",
+    "mtm_bfq": "动量指标 N=12", "mtmma_bfq": "MTM的M日均线 M=6",
+    "psy_bfq": "心理线 N=12", "psyma_bfq": "PSY的M日均线 M=6",
+    "boll_upper_bfq": "布林带 N=20, P=2", "boll_mid_bfq": "布林带中枢", "boll_lower_bfq": "布林带下轨",
+    "ktn_upper_bfq": "肯特纳通道 N=20, ATR=10", "ktn_mid_bfq": "肯特纳通道中枢", "ktn_down_bfq": "肯特纳通道下轨",
+    "taq_up_bfq": "唐安奇通道(海龟) N=20", "taq_mid_bfq": "唐安奇通道中枢", "taq_down_bfq": "唐安奇通道下轨",
+    "xsii_td1_bfq": "薛斯通道II N=102, M=7", "xsii_td2_bfq": "薛斯通道II", "xsii_td3_bfq": "薛斯通道II", "xsii_td4_bfq": "薛斯通道II",
+    "obv_bfq": "能量潮指标", "vr_bfq": "容量比率 M1=26", "mfi_bfq": "资金流量指标 N=14",
+    "atr_bfq": "真实波动20日均值 N=20", "emv_bfq": "简易波动指标 N=14", "maemv_bfq": "EMV的M日均线 M=9",
+    "brar_ar_bfq": "人气指标 M1=26", "brar_br_bfq": "意愿指标 M1=26", "cr_bfq": "价格动量指标 N=20",
+    "mass_bfq": "梅斯线 N1=9, N2=25", "ma_mass_bfq": "梅斯线的M日均线 M=6",
+    "asi_bfq": "振动升降指标 M1=26", "asit_bfq": "ASI的M日均线 M2=10",
+    "updays": "连续上涨交易日数", "downdays": "连续下跌交易日数", "topdays": "当前最高价为近N周期内最高", "lowdays": "当前最低价为近N周期内最低",
+}
+
+# 技术因子勾选上限（UI 保存校验 + generate_ai_report 防御截断共用）
+MAX_FACTOR_COUNT = 10
+
+# 整数型因子（涨跌统计：连续天数/周期数），prompt 中按整数格式化
+_INTEGER_FACTOR_KEYS = frozenset({"updays", "downdays", "topdays", "lowdays"})
+
+
+def _fmt_factor(key: str, v):
+    """技术因子格式化：涨跌统计类为整数，其余保留 3 位小数"""
+    if v is None:
+        return None
+    return f"{v:.0f}" if key in _INTEGER_FACTOR_KEYS else f"{v:.3f}"
+
+
 # 未配置指标筛选时的默认指标（与 UI 默认勾选一致）
 DEFAULT_INDICATORS = ["pe", "pb"]
 
@@ -70,11 +210,33 @@ def default_indicators_for(category: str) -> list[str]:
     return DEFAULT_INDICATORS
 
 
+def normalize_selected_indicators(selected: list[str] | None, category: str) -> list[str]:
+    """归一化并截断用户勾选列表，供 LLM 调用与调度器签名共用。
+
+    - 未配置（None/空）时按分类默认指标；
+    - 基础指标与技术因子分别排序后拼接，保证「相同签名 ⟺ 相同最终 prompt」；
+    - 技术因子超出 MAX_FACTOR_COUNT 时截断为前 N 个（防御老数据/直调越界）。
+    """
+    effective = selected or default_indicators_for(category)
+    base_keys = sorted(k for k in effective if k in INDICATOR_META)
+    factor_keys = sorted(k for k in effective if k in FACTOR_LABELS)
+    if len(factor_keys) > MAX_FACTOR_COUNT:
+        logger.warning(
+            f"normalize_selected_indicators: 技术因子 {len(factor_keys)} 个超过上限 "
+            f"{MAX_FACTOR_COUNT}，截断为前 {MAX_FACTOR_COUNT} 个"
+        )
+        factor_keys = factor_keys[:MAX_FACTOR_COUNT]
+    return base_keys + factor_keys
+
+
 def indicator_groups_for(category: str) -> list:
-    """按策略分类返回指标展示分组（提示词勾选 UI 与 user_prompt 生成共用）"""
+    """按策略分类返回指标展示分组（提示词勾选 UI 与 user_prompt 生成共用）。
+
+    非国际指数追加技术因子分组（仅勾选项实际渲染）；国际指数无因子数据，不追加。
+    """
     if category == 'global':
         return GLOBAL_INDICATOR_GROUPS
-    return INDICATOR_GROUPS
+    return INDICATOR_GROUPS + FACTOR_GROUPS
 
 
 def _build_indicators_text(inds: dict, selected: list[str] | None, groups: list | None = None) -> str:
@@ -90,7 +252,15 @@ def _build_indicators_text(inds: dict, selected: list[str] | None, groups: list 
             val = inds.get(key)
             if val is None:
                 continue
-            label, fmt = INDICATOR_META[key]
+            meta = INDICATOR_META.get(key)
+            if meta is None:
+                # 技术因子：回退到 FACTOR_LABELS（未知 key 静默跳过，避免 KeyError）
+                if key not in FACTOR_LABELS:
+                    continue
+                label = FACTOR_LABELS[key]
+                fmt = lambda v, k=key: _fmt_factor(k, v)
+            else:
+                label, fmt = meta
             formatted = fmt(val)
             if formatted is not None:
                 parts.append(f"{label} {formatted}")
@@ -243,8 +413,8 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
     # 构建 System Prompt
     system_prompt = _build_system_prompt(cat, custom_prompt)
 
-    # 构建 User Prompt（动态按勾选指标与分类分组生成）
-    effective_selected = selected_indicators or default_indicators_for(cat)
+    # 构建 User Prompt（归一化与 scheduler 签名共用同一函数，保证缓存键与实际 prompt 一致）
+    effective_selected = normalize_selected_indicators(selected_indicators, cat)
     indicators_text = _build_indicators_text(inds, effective_selected, groups=indicator_groups_for(cat))
     if selected_indicators:
         logger.info(f"generate_ai_report: {code} 已筛选指标 {selected_indicators}")

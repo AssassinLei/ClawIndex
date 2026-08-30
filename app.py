@@ -5,9 +5,9 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_shared_category, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_latest_trade_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_user_setting, set_user_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt, register_user, user_exists
+from database import init_db, add_fund, remove_fund, get_all_funds, get_shared_category, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_idx_factor_for_date, get_latest_trade_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_user_setting, set_user_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt, register_user, user_exists
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, fetch_index_members, is_trade_day, is_global_code
-from llm_agent import INDICATOR_META, INDICATOR_GROUPS, GLOBAL_INDICATOR_GROUPS, default_indicators_for
+from llm_agent import INDICATOR_META, INDICATOR_GROUPS, GLOBAL_INDICATOR_GROUPS, default_indicators_for, FACTOR_GROUPS, FACTOR_LABELS, FACTOR_CN, FACTOR_DESC, MAX_FACTOR_COUNT, _fmt_factor
 from webhook_sender import send_to_all_webhooks, is_action_pushable
 from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running, update_cron_expression
 from constants import CATEGORY_NAMES, GLOBAL_INDEX_MAP
@@ -219,117 +219,34 @@ TREND_RANGE_OPTIONS = {
 }
 
 
-# 技术因子展示元数据：(分组名, [(列名, 指标标签, 参数说明)])，列名对应 idx_factor_data 表
-FACTOR_GROUPS = [
-    ("均线类", [
-        ("ma_bfq_5",     "MA5",      "5日简单移动平均"),
-        ("ma_bfq_10",    "MA10",     "10日简单移动平均"),
-        ("ma_bfq_20",    "MA20",     "20日简单移动平均"),
-        ("ma_bfq_30",    "MA30",     "30日简单移动平均"),
-        ("ma_bfq_60",    "MA60",     "60日简单移动平均"),
-        ("ma_bfq_90",    "MA90",     "90日简单移动平均"),
-        ("ma_bfq_250",   "MA250",    "250日简单移动平均（年线）"),
-        ("ema_bfq_5",    "EMA5",     "5日指数移动平均"),
-        ("ema_bfq_10",   "EMA10",    "10日指数移动平均"),
-        ("ema_bfq_20",   "EMA20",    "20日指数移动平均"),
-        ("ema_bfq_30",   "EMA30",    "30日指数移动平均"),
-        ("ema_bfq_60",   "EMA60",    "60日指数移动平均"),
-        ("ema_bfq_90",   "EMA90",    "90日指数移动平均"),
-        ("ema_bfq_250",  "EMA250",   "250日指数移动平均"),
-        ("expma_12_bfq", "EXPMA12",  "EMA指数平均数 N1=12"),
-        ("expma_50_bfq", "EXPMA50",  "EMA指数平均数 N2=50"),
-        ("bbi_bfq",      "BBI",      "多空指标 M=3/6/12/20"),
-    ]),
-    ("趋势类", [
-        ("macd_dif_bfq",   "MACD DIF",  "快慢线差 SHORT=12, LONG=26"),
-        ("macd_dea_bfq",   "MACD DEA",  "DIF的M日平滑 M=9"),
-        ("macd_bfq",       "MACD",      "MACD柱 (DIF-DEA)×2"),
-        ("dmi_pdi_bfq",    "DMI +DI",   "上升方向线 M1=14"),
-        ("dmi_mdi_bfq",    "DMI -DI",   "下降方向线 M1=14"),
-        ("dmi_adx_bfq",    "DMI ADX",   "趋势平均线 M2=6"),
-        ("dmi_adxr_bfq",   "DMI ADXR",  "ADX评估线"),
-        ("trix_bfq",       "TRIX",      "三重指数平滑均线 M1=12"),
-        ("trma_bfq",       "TRMA",      "TRIX的M日均线 M2=20"),
-        ("dpo_bfq",        "DPO",       "区间震荡线 M1=20"),
-        ("madpo_bfq",      "MADPO",     "DPO的平滑线 M2=10"),
-        ("dfma_dif_bfq",   "DMA DIF",   "平行线差 N1=10, N2=50"),
-        ("dfma_difma_bfq", "DMA DIFMA", "DIF的M日均线 M=10"),
-    ]),
-    ("摆动类", [
-        ("kdj_k_bfq",   "KDJ K",   "K值 N=9, M1=3"),
-        ("kdj_d_bfq",   "KDJ D",   "D值 M2=3"),
-        ("kdj_bfq",     "KDJ J",   "J值 3K-2D"),
-        ("rsi_bfq_6",   "RSI6",    "6日相对强弱指标"),
-        ("rsi_bfq_12",  "RSI12",   "12日相对强弱指标"),
-        ("rsi_bfq_24",  "RSI24",   "24日相对强弱指标"),
-        ("wr_bfq",      "W&R",     "威廉指标 N=10"),
-        ("wr1_bfq",     "W&R1",    "威廉指标 N1=6"),
-        ("cci_bfq",     "CCI",     "顺势指标 N=14"),
-        ("bias1_bfq",   "BIAS6",   "乖离率 L1=6"),
-        ("bias2_bfq",   "BIAS12",  "乖离率 L2=12"),
-        ("bias3_bfq",   "BIAS24",  "乖离率 L3=24"),
-        ("roc_bfq",     "ROC",     "变动率指标 N=12"),
-        ("maroc_bfq",   "MAROC",   "ROC的M日均线 M=6"),
-        ("mtm_bfq",     "MTM",     "动量指标 N=12"),
-        ("mtmma_bfq",   "MTMMA",   "MTM的M日均线 M=6"),
-        ("psy_bfq",     "PSY",     "心理线 N=12"),
-        ("psyma_bfq",   "PSYMA",   "PSY的M日均线 M=6"),
-    ]),
-    ("通道类", [
-        ("boll_upper_bfq", "BOLL上轨", "布林带 N=20, P=2"),
-        ("boll_mid_bfq",   "BOLL中轨", "布林带中枢"),
-        ("boll_lower_bfq", "BOLL下轨", "布林带下轨"),
-        ("ktn_upper_bfq",  "KTN上轨",  "肯特纳通道 N=20, ATR=10"),
-        ("ktn_mid_bfq",    "KTN中轨",  "肯特纳通道中枢"),
-        ("ktn_down_bfq",   "KTN下轨",  "肯特纳通道下轨"),
-        ("taq_up_bfq",     "TAQ上轨",  "唐安奇通道(海龟) N=20"),
-        ("taq_mid_bfq",    "TAQ中轨",  "唐安奇通道中枢"),
-        ("taq_down_bfq",   "TAQ下轨",  "唐安奇通道下轨"),
-        ("xsii_td1_bfq",   "XSII TD1", "薛斯通道II N=102, M=7"),
-        ("xsii_td2_bfq",   "XSII TD2", "薛斯通道II"),
-        ("xsii_td3_bfq",   "XSII TD3", "薛斯通道II"),
-        ("xsii_td4_bfq",   "XSII TD4", "薛斯通道II"),
-    ]),
-    ("量能与波动", [
-        ("obv_bfq",     "OBV",     "能量潮指标"),
-        ("vr_bfq",      "VR",      "容量比率 M1=26"),
-        ("mfi_bfq",     "MFI",     "资金流量指标 N=14"),
-        ("atr_bfq",     "ATR",     "真实波动20日均值 N=20"),
-        ("emv_bfq",     "EMV",     "简易波动指标 N=14"),
-        ("maemv_bfq",   "MAEMV",   "EMV的M日均线 M=9"),
-        ("brar_ar_bfq", "BRAR AR", "人气指标 M1=26"),
-        ("brar_br_bfq", "BRAR BR", "意愿指标 M1=26"),
-        ("cr_bfq",      "CR",      "价格动量指标 N=20"),
-        ("mass_bfq",    "MASS",    "梅斯线 N1=9, N2=25"),
-        ("ma_mass_bfq", "MAMASS",  "梅斯线的M日均线 M=6"),
-        ("asi_bfq",     "ASI",     "振动升降指标 M1=26"),
-        ("asit_bfq",    "ASIT",    "ASI的M日均线 M2=10"),
-    ]),
-    ("涨跌统计", [
-        ("updays",   "连涨天数", "连续上涨交易日数"),
-        ("downdays", "连跌天数", "连续下跌交易日数"),
-        ("topdays",  "高点周期", "当前最高价为近N周期内最高"),
-        ("lowdays",  "低点周期", "当前最低价为近N周期内最低"),
-    ]),
-]
 
+def render_factor_panel(fund_code: str, trade_date: str | None = None):
+    """在 popover 内渲染技术因子数据，按类别分组展示。
 
-def render_factor_panel(fund_code: str):
-    """在 popover 内渲染最新一日的技术因子数据，按类别分组展示。"""
-    factor = get_latest_idx_factor(fund_code)
+    trade_date 为 None 时展示最新一日（研判页）；传入日期时优先匹配该日
+    （历史页回溯），无当日数据则回退到最新可用并提示。
+    """
+    factor = get_idx_factor_for_date(fund_code, trade_date) if trade_date else get_latest_idx_factor(fund_code)
+    fallback_used = False
+    if trade_date and not factor:
+        factor = get_latest_idx_factor(fund_code)
+        fallback_used = True
     if not factor:
         st.caption("暂无技术因子数据（可能接口无权限或尚未同步）")
         return
 
+    if fallback_used:
+        actual_date = factor.get('trade_date', '?')
+        st.caption(f"⚠️ 巡检日期 ({trade_date}) 无因子数据，展示最新可用数据 (交易日: {actual_date})")
     st.caption(f"交易日期：{factor.get('trade_date', 'N/A')} · 数据来源：Tushare idx_factor_pro（不复权）")
-    for group_label, items in FACTOR_GROUPS:
+    for group_label, group_keys in FACTOR_GROUPS:
         rows = []
-        for col, label, desc in items:
+        for col in group_keys:
             val = factor.get(col)
             rows.append({
-                "指标": label,
-                "数值": f"{val:.3f}" if val is not None else "N/A",
-                "说明": desc,
+                "指标": FACTOR_LABELS[col],
+                "数值": _fmt_factor(col, val) if val is not None else "N/A",
+                "说明": FACTOR_DESC.get(col, ""),
             })
         st.markdown(f"**{group_label}**")
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
@@ -794,10 +711,12 @@ if auto_toggle != auto_current:
 # Cron 调度表达式配置（全局）
 cron_current = get_setting("scheduler_cron_expr", "30 19 * * 1-5")
 with st.sidebar.form("cron_form", clear_on_submit=False):
+    cron_key = "cron_expr_input"
+    if cron_key not in st.session_state:
+        st.session_state[cron_key] = cron_current
     cron_input = st.text_input(
         "调度时间（标准 5 字段 Cron）",
-        value=cron_current,
-        key="cron_expr_input",
+        key=cron_key,
         help="格式：分 时 日 月 周。默认 30 19 * * 1-5 = 工作日 19:30；周字段 0=周一…6=周日（如周二、周四=1,3），也可用英文缩写 tue,thu。执行前仍会二次校验交易日",
     )
     if st.form_submit_button("保存调度时间"):
@@ -1177,6 +1096,13 @@ with tab2:
                             col_c4.metric("120日均线", ma120_str)
                     else:
                         st.caption("该记录为旧版数据，无计算指标（请重新巡检以生成）")
+
+                    # 技术因子入口（国际指数无因子数据，不展示）：按巡检日期回溯当日因子，
+                    # 无当日数据时回退最新可用，与行情数据的回退策略一致
+                    if not is_global_rec:
+                        with st.popover("🔬 技术因子", use_container_width=True,
+                                        help="查看该指数巡检当日的全部技术面因子（MACD/KDJ/RSI/BOLL 等），无当日数据时展示最新可用"):
+                            render_factor_panel(record['fund_code'], record['inspect_date'])
                     
                     # AI 报告
                     st.markdown("**AI 投顾解读**")
@@ -1217,6 +1143,8 @@ with tab3:
             is_global_fund = cat == 'global'
             prompt_groups = GLOBAL_INDICATOR_GROUPS if is_global_fund else INDICATOR_GROUPS
             all_meta_keys = [key for _, keys in prompt_groups for key in keys]
+            # 技术因子仅对非国际指数开放（国际指数无 idx_factor_pro 因子数据）
+            all_factor_keys = [] if is_global_fund else [k for _, keys in FACTOR_GROUPS for k in keys]
 
             # 当前配置状态（仅当前用户）
             current_prompt = get_custom_prompt(username, code)
@@ -1225,14 +1153,17 @@ with tab3:
             else:
                 st.info(f"⚪ **{name}** 使用系统默认策略（分类: {CATEGORY_NAMES.get(cat, cat)}）")
 
-            # 提示词编辑器
+            # 提示词编辑器（只传 key 不传 value：初始值经 session_state 预置，
+            # 避免 key 与 value 同时存在触发 Streamlit 冲突警告）
+            prompt_key = f"prompt_editor_{username}_{code}"
+            if prompt_key not in st.session_state:
+                st.session_state[prompt_key] = current_prompt or ""
             prompt_text = st.text_area(
                 "提示词内容",
-                value=current_prompt or "",
                 height=280,
                 max_chars=8000,
                 placeholder="在此输入专属分析框架，例如：\n该指数属于消费行业，侧重分析 ROE 稳定性和现金流质量...\n\n留空则使用系统默认策略。",
-                key=f"prompt_editor_{username}_{code}",
+                key=prompt_key,
                 help="提示词将替换 AI 分析中的「估值解读框架」段落。系统红线（只能基于数据解读、不做预测、不改变决策）始终生效。"
             )
 
@@ -1251,38 +1182,86 @@ with tab3:
                     st.session_state[f"ind_{username}_{code}_{key}"] = True
                 st.rerun()
 
-            # 按分组展示指标 checkboxes
+            # 按分组展示指标 checkboxes（只传 key 不传 value，初始值经 session_state 预置）
             selected_keys = []
             for group_label, group_keys in prompt_groups:
                 cols = st.columns(len(group_keys))
-                for i, key in enumerate(group_keys):
-                    label = INDICATOR_META[key][0]
-                    checked = cols[i].checkbox(
-                        label,
-                        value=(key in default_checked),
-                        key=f"ind_{username}_{code}_{key}",
-                    )
+                for i, ind_key in enumerate(group_keys):
+                    label = INDICATOR_META[ind_key][0]
+                    wkey = f"ind_{username}_{code}_{ind_key}"
+                    if wkey not in st.session_state:
+                        st.session_state[wkey] = (ind_key in default_checked)
+                    checked = cols[i].checkbox(label, key=wkey)
                     if checked:
-                        selected_keys.append(key)
+                        selected_keys.append(ind_key)
 
             # 如果没有勾选任何指标，默认全部（按分类清单）
             if not selected_keys:
                 selected_keys = all_meta_keys
 
+            # 技术因子勾选（最多 MAX_FACTOR_COUNT 个；国际指数无因子数据，跳过）
+            selected_factors = []
+            if all_factor_keys:
+                st.markdown("**🔬 技术因子（最多 10 个）**")
+                st.caption("勾选需要传递给 AI 的技术因子（MACD/KDJ/RSI/BOLL 等），不勾选则不传递。数据来源：Tushare idx_factor_pro。上方「☑️ 全选」仅作用于基础指标。")
+                # 预置 checkbox 状态（只传 key 不传 value，避免 widget 冲突警告）；
+                # 已保存配置中的因子 key 混存在 selected_indicators 里，按 FACTOR_LABELS 识别
+                default_factors = [k for k in saved_indicators if k in FACTOR_LABELS]
+                with st.expander("选择技术因子", expanded=False):
+                    for group_label, group_keys in FACTOR_GROUPS:
+                        st.caption(group_label)
+                        cols = st.columns(4)
+                        for i, fk in enumerate(group_keys):
+                            wkey = f"factor_{username}_{code}_{fk}"
+                            if wkey not in st.session_state:
+                                st.session_state[wkey] = (fk in default_factors)
+                            # label 展示「中文名 (缩写)」；中文名与缩写相同时不重复（如连涨天数）
+                            cn_name = FACTOR_CN.get(fk, "")
+                            abbr = FACTOR_LABELS[fk]
+                            factor_label = (
+                                f"{cn_name} ({abbr})" if cn_name and cn_name != abbr else (cn_name or abbr)
+                            )
+                            checked = cols[i % 4].checkbox(
+                                factor_label, key=wkey,
+                                help=FACTOR_DESC.get(fk, ""),
+                            )
+                            if checked:
+                                selected_factors.append(fk)
+                if len(selected_factors) > MAX_FACTOR_COUNT:
+                    st.error(f"⚠️ 已选 {len(selected_factors)} 个技术因子，超过上限 {MAX_FACTOR_COUNT} 个，请取消部分勾选后再保存。")
+                else:
+                    st.caption(f"已选 {len(selected_factors)}/{MAX_FACTOR_COUNT} 个技术因子")
+                if selected_factors and st.button("🧹 清空技术因子", key=f"clear_factors_{username}_{code}"):
+                    for fk in all_factor_keys:
+                        st.session_state[f"factor_{username}_{code}_{fk}"] = False
+                    st.rerun()
+
             col_btn1, col_btn2 = st.columns([1, 1])
             with col_btn1:
                 if st.button("💾 保存提示词", key=f"save_prompt_{username}_{code}", type="primary", use_container_width=True):
-                    if prompt_text.strip():
-                        upsert_custom_prompt(username, code, prompt_text.strip(), indicators=selected_keys)
-                        st.session_state.prompt_saved_msg = f"已保存 {name} 的定制提示词（{len(selected_keys)} 项指标）"
-                        st.rerun()
-                    else:
+                    if not prompt_text.strip():
                         st.warning("提示词内容为空，请先编写后再保存。如需恢复默认，请点击「重置为默认」。")
+                    elif len(selected_factors) > MAX_FACTOR_COUNT:
+                        st.error(f"技术因子最多选择 {MAX_FACTOR_COUNT} 个，当前已选 {len(selected_factors)} 个，请取消多余勾选后再保存。")
+                    else:
+                        upsert_custom_prompt(username, code, prompt_text.strip(), indicators=selected_keys + selected_factors)
+                        msg = f"已保存 {name} 的定制提示词（{len(selected_keys)} 项指标"
+                        if selected_factors:
+                            msg += f"，{len(selected_factors)} 项技术因子"
+                        msg += "）"
+                        st.session_state.prompt_saved_msg = msg
+                        st.rerun()
 
             with col_btn2:
                 if current_prompt:
                     if st.button("🗑️ 重置为默认", key=f"reset_prompt_{username}_{code}", use_container_width=True):
                         delete_custom_prompt(username, code)
+                        # 清除会话状态中的残留草稿，否则重建时 UI 仍显示旧勾选/旧文本，与已恢复默认不符
+                        st.session_state.pop(f"prompt_editor_{username}_{code}", None)
+                        for ind_key in all_meta_keys:
+                            st.session_state.pop(f"ind_{username}_{code}_{ind_key}", None)
+                        for fk in all_factor_keys:
+                            st.session_state.pop(f"factor_{username}_{code}_{fk}", None)
                         st.warning(f"已清除 {name} 的定制提示词，恢复系统默认策略")
                         st.rerun()
 

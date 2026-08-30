@@ -1,5 +1,5 @@
 import pandas as pd
-from database import get_recent_prices, calculate_percentile, get_latest_market_data
+from database import get_recent_prices, calculate_percentile, get_latest_market_data, get_latest_idx_factor, IDX_FACTOR_TECH_COLUMNS
 from logger import setup_logger
 
 logger = setup_logger("strategy_engine")
@@ -87,6 +87,13 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
         "amount": amount,
         "amount_ma20": amount_ma20,
     }
+
+    # 非国际指数并入最新一日技术因子（仅 78 项技术列，不含 open/amount 等行情列，
+    # 避免覆盖既有指标键），供 AI 按用户勾选引用。无因子数据时返回空 dict，因子键自然缺失
+    if not is_global:
+        latest_factor = get_latest_idx_factor(fund_code)
+        for key in IDX_FACTOR_TECH_COLUMNS:
+            indicators[key] = latest_factor.get(key)
     
     logger.info(f"generate_fund_report: {fund_code} (category={category}) PE={pe} PB={pb} PE%={pe_percentile} 价格分位={price_percentile}")
     

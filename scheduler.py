@@ -21,7 +21,7 @@ from database import (
 )
 from data_fetcher import is_trade_day, is_global_code
 from inspection_pipeline import prepare_fund_data, analyze_and_save_for_user
-from llm_agent import generate_ai_report, default_indicators_for
+from llm_agent import generate_ai_report, normalize_selected_indicators
 from webhook_sender import send_to_all_webhooks, is_action_pushable
 
 logger = setup_logger("scheduler")
@@ -116,9 +116,10 @@ def run_scheduled_inspection():
 
                 for user in watchers:
                     custom_prompt, selected_indicators = configs.get(user, (None, []))
-                    # 归一化：空配置与显式勾选默认指标的 Prompt 完全一致，统一按分类默认指标处理
-                    effective_inds = selected_indicators or default_indicators_for(cat)
-                    signature = (custom_prompt, tuple(sorted(effective_inds)))
+                    # 归一化：空配置与显式勾选默认指标的 Prompt 完全一致，统一按分类默认指标处理；
+                    # 技术因子排序截断与 generate_ai_report 内部口径一致，保证签名相同 ⟺ 最终 prompt 相同
+                    effective_inds = normalize_selected_indicators(selected_indicators, cat)
+                    signature = (custom_prompt, tuple(effective_inds))
                     ai_result = group_cache.get(signature)
                     if ai_result is None:
                         ai_result = generate_ai_report(
