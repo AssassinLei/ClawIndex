@@ -70,29 +70,49 @@ def build_feishu_post(fund_data: Dict) -> tuple:
         content.append([{"tag": "text", "text": f"\n❌ 数据异常：{error_msg}"}])
         return title, content
 
-    # 段落 2：核心指标
-    price = _format_indicator(inds.get("price"), "{:.3f}")
-    pe = _format_indicator(inds.get("pe"))
-    pb = _format_indicator(inds.get("pb"))
-    if inds.get("pe_percentile") is not None:
-        pe_pct = f"{inds['pe_percentile'] * 100:.1f}%"
-    else:
-        pe_pct = "N/A"
-    rp = _format_indicator(inds.get("risk_premium"), "{:.4f}")
-    if inds.get("roe") is not None:
-        roe = f"{inds['roe'] * 100:.2f}%"
-    else:
-        roe = "N/A"
+    # 段落 2：核心指标（国际指数无估值数据，展示价格与趋势指标）
+    if fund_data.get("category") == "global":
+        price = _format_indicator(inds.get("price"), "{:.3f}")
+        if inds.get("price_percentile") is not None:
+            price_pct = f"{inds['price_percentile'] * 100:.1f}%"
+        else:
+            price_pct = "N/A"
+        pct_chg = _format_indicator(inds.get("pct_chg"), "{:.2f}%")
+        ma60 = _format_indicator(inds.get("ma60"), "{:.3f}")
+        ma120 = _format_indicator(inds.get("ma120"), "{:.3f}")
 
-    content.append([
-        {"tag": "text", "text": (
-            f"\n━━━ 📈 核心指标 ━━━\n"
-            f"  当前价格：{price}\n"
-            f"  市盈率(PE)：{pe}     分位：{pe_pct}\n"
-            f"  市净率(PB)：{pb}     ROE：{roe}\n"
-            f"  风险溢价：{rp}"
-        )},
-    ])
+        content.append([
+            {"tag": "text", "text": (
+                f"\n━━━ 📈 核心指标 ━━━\n"
+                f"  当前价格：{price}\n"
+                f"  价格历史分位：{price_pct}\n"
+                f"  当日涨跌幅：{pct_chg}\n"
+                f"  MA60：{ma60}     MA120：{ma120}"
+            )},
+        ])
+    else:
+        price = _format_indicator(inds.get("price"), "{:.3f}")
+        pe = _format_indicator(inds.get("pe"))
+        pb = _format_indicator(inds.get("pb"))
+        if inds.get("pe_percentile") is not None:
+            pe_pct = f"{inds['pe_percentile'] * 100:.1f}%"
+        else:
+            pe_pct = "N/A"
+        rp = _format_indicator(inds.get("risk_premium"), "{:.4f}")
+        if inds.get("roe") is not None:
+            roe = f"{inds['roe'] * 100:.2f}%"
+        else:
+            roe = "N/A"
+
+        content.append([
+            {"tag": "text", "text": (
+                f"\n━━━ 📈 核心指标 ━━━\n"
+                f"  当前价格：{price}\n"
+                f"  市盈率(PE)：{pe}     分位：{pe_pct}\n"
+                f"  市净率(PB)：{pb}     ROE：{roe}\n"
+                f"  风险溢价：{rp}"
+            )},
+        ])
 
     # 段落 3：AI 分析
     details_text = "\n".join(f"  • {d}" for d in details) if details else "  • 无（数据异常）"

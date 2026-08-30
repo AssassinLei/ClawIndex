@@ -58,6 +58,19 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
     # 4. 提取当日成交额
     amount = latest_data.get('amount')
 
+    # 国际指数无估值数据：以价格历史分位替代 PE/PB 分位，当日涨跌幅补充动量信息
+    # （申万行业指数这两个键置 None，不影响既有逻辑）
+    is_global = category == 'global'
+    price_percentile = (
+        calculate_percentile(fund_code, 'close_price', current_price)
+        if is_global and current_price is not None else None
+    )
+    pct_chg = latest_data.get('pct_change') if is_global else None
+
+    # 国际指数无成交额数据：amount_ma20 无意义（滚动均值为 NaN），显式置 None 避免脏数据入库
+    if is_global:
+        amount_ma20 = None
+
     # 组装完整的指标库用于判定
     indicators = {
         "price": current_price,
@@ -67,13 +80,15 @@ def generate_fund_report(fund_code: str, category: str) -> dict:
         "pb": pb,
         "pe_percentile": pe_percentile,
         "pb_percentile": pb_percentile,
+        "price_percentile": price_percentile,
+        "pct_chg": pct_chg,
         "roe": roe,
         "risk_premium": risk_premium,
         "amount": amount,
         "amount_ma20": amount_ma20,
     }
     
-    logger.info(f"generate_fund_report: {fund_code} (category={category}) PE={pe} PB={pb} PE%={pe_percentile}")
+    logger.info(f"generate_fund_report: {fund_code} (category={category}) PE={pe} PB={pb} PE%={pe_percentile} 价格分位={price_percentile}")
     
     return {
         "fund_code": fund_code,

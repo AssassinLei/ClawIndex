@@ -65,6 +65,7 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | `tech_growth` | 科技成长 | PE 分位 + MA120 趋势过滤 |
 | `cycle_mfg` | 周期制造 | PB 分位 |
 | `dividend` | 稳健收息 | PB 分位 + PE 绝对值 |
+| `global` | 国际指数 | 价格 + MA60/MA120 趋势 + 价格历史分位（无估值数据，固定唯一分类） |
 
 ### `daily_market_data` — 每日行情缓存（全局共享）
 
@@ -165,8 +166,8 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | 初始化表结构 | `app.py` → `init_db()` | 全部 | 应用每次加载时执行 |
 | 注册用户 | `app.py` 登录门 → `register_user()` | `users` | 重名返回 False |
 | 添加标的 | `app.py` → `add_fund(username, ...)` | `fund_pool` | 同用户重复添加触发唯一约束，静默忽略；他人已监控时强制沿用已有 category |
-| 同步历史数据 | `data_fetcher.py` → `save_daily_data()` / `save_idx_factor_data()` | `daily_market_data` / `idx_factor_data` | 添加标的时拉近 10 年；行情已存在（他人已同步）则跳过全量拉取，改走 `sync_incremental` 补齐增量 |
-| 增量同步 | 巡检流水线 → `sync_incremental()` | 同上 | 每次巡检前补齐 DB 最新日期到今天的缺口（行情与因子独立判断） |
+| 同步历史数据 | `data_fetcher.py` → `save_daily_data()` / `save_idx_factor_data()` | `daily_market_data` / `idx_factor_data` | 添加标的时拉近 10 年（国际指数走 `index_global` 接口，无因子数据）；行情已存在（他人已同步）则跳过全量拉取，改走 `sync_incremental` 补齐增量 |
+| 增量同步 | 巡检流水线 → `sync_incremental()` | 同上 | 每次巡检前补齐 DB 最新日期到今天的缺口（行情与因子独立判断）；国际指数不依赖 A 股交易日历、跳过因子同步 |
 | 删除标的 | `app.py` → `remove_fund(username, code)` | 多表 | 删本用户监控关系与其专属提示词；无其他用户监控才清理共享行情/因子（巡检记录保留） |
 | 巡检入库 | `inspection_pipeline.py` → `save_inspection_result()` | `inspection_log` | 同用户同标的同日覆盖更新 |
 | 定时巡检 | `scheduler.py` → `get_distinct_funds()` | `fund_pool` | 全用户并集去重，同一指数每天只同步/计算一次；按用户提示词配置分组去重调用 AI，每用户各自入库与推送 |
@@ -253,6 +254,8 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 ### 4. 分位数计算有最低数据量要求
 
 `calculate_percentile()` 要求该标的有效历史记录 **≥ 100 条**，否则返回 `None`，AI 输入中将缺少分位指标。默认回溯窗口 `lookback_days=2500`（约 10 个交易年）。
+
+国际指数无估值数据，改用收盘价计算「价格历史分位」（`indicator='close_price'`），语义为「低于当前收盘价的历史天数占比」。
 
 ### 5. `risk_free_rate` 为真实宏观数据
 

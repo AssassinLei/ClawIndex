@@ -6,11 +6,11 @@ import pandas as pd
 import re
 from pathlib import Path
 from database import init_db, add_fund, remove_fund, get_all_funds, get_shared_category, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_latest_trade_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_user_setting, set_user_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt, register_user, user_exists
-from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, fetch_index_members, is_trade_day
-from llm_agent import INDICATOR_META, INDICATOR_GROUPS
+from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, fetch_index_members, is_trade_day, is_global_code
+from llm_agent import INDICATOR_META, INDICATOR_GROUPS, GLOBAL_INDICATOR_GROUPS, default_indicators_for
 from webhook_sender import send_to_all_webhooks, is_action_pushable
 from scheduler import start_scheduler, stop_scheduler, get_next_run_time, is_scheduler_running, update_cron_expression
-from constants import CATEGORY_NAMES
+from constants import CATEGORY_NAMES, GLOBAL_INDEX_MAP
 from inspection_pipeline import run_single_inspection
 from datetime import datetime, timedelta
 
@@ -205,6 +205,8 @@ TREND_INDICATORS = {
                       "风险溢价",                          "计算方式：1 ÷ PE − 无风险利率（Fed 模型）\n无风险利率 = 10 年期国债收益率"),
     'amount':        (['amount'],                         None,
                       "成交额",                            "数据来源：Tushare 申万指数日线行情"),
+    'price_percentile': (['close_price'],                 lambda df: df['close_price'].expanding().rank(pct=True),
+                      "价格历史分位",                      "计算方式：收盘价从最早至今的累积历史分位（expanding rank）"),
 }
 
 
@@ -453,20 +455,31 @@ def render_card_expander(card: dict, expanded: bool = False):
                 # 每行一对指标，用 4 列布局（指标A | 按钮A | 指标B | 按钮B）
                 # key=None 表示该指标不可点击，按钮列留空
                 code = card['code']
-                metric_rows = [
-                    ("当前价格",  _fmt(inds.get("price"), "{:.3f}"), 'close_price',
-                     "PB 历史分位", f"{inds['pb_percentile'] * 100:.1f}%" if inds.get("pb_percentile") is not None else "N/A", 'pb_percentile'),
-                    ("市盈率 (PE)", _fmt(inds.get("pe")), 'pe',
-                     "风险溢价",    _fmt(inds.get("risk_premium"), "{:.4f}"), 'risk_premium'),
-                    ("PE 历史分位", f"{inds['pe_percentile'] * 100:.1f}%" if inds.get("pe_percentile") is not None else "N/A", None,
-                     "60日均线",    _fmt(inds.get("ma60"), "{:.3f}"), None),
-                    ("市净率 (PB)", _fmt(inds.get("pb")), 'pb',
-                     "120日均线",   _fmt(inds.get("ma120"), "{:.3f}"), None),
-                    ("ROE",         f"{inds['roe'] * 100:.2f}%" if inds.get("roe") is not None else "N/A", 'roe',
-                     "成交额", _fmt(inds.get("amount"), "{:.0f}"), 'amount'),
-                ]
-                # 最后一行只有右侧指标（20日均成交额不可点击）
-                last_row = (None, None, None, "20日均成交额", _fmt(inds.get("amount_ma20"), "{:.0f}"), None)
+                if card.get('category') == 'global':
+                    # 国际指数无估值数据：展示价格、价格历史分位、涨跌幅与均线
+                    metric_rows = [
+                        ("当前价格",  _fmt(inds.get("price"), "{:.3f}"), 'close_price',
+                         "价格历史分位", f"{inds['price_percentile'] * 100:.1f}%" if inds.get("price_percentile") is not None else "N/A", 'price_percentile'),
+                        ("当日涨跌幅", _fmt(inds.get("pct_chg"), "{:.2f}%"), None,
+                         "60日均线",  _fmt(inds.get("ma60"), "{:.3f}"), None),
+                    ]
+                    # 最后一行只有左侧指标（120日均线不可点击）
+                    last_row = ("120日均线", _fmt(inds.get("ma120"), "{:.3f}"), None, None, None, None)
+                else:
+                    metric_rows = [
+                        ("当前价格",  _fmt(inds.get("price"), "{:.3f}"), 'close_price',
+                         "PB 历史分位", f"{inds['pb_percentile'] * 100:.1f}%" if inds.get("pb_percentile") is not None else "N/A", 'pb_percentile'),
+                        ("市盈率 (PE)", _fmt(inds.get("pe")), 'pe',
+                         "风险溢价",    _fmt(inds.get("risk_premium"), "{:.4f}"), 'risk_premium'),
+                        ("PE 历史分位", f"{inds['pe_percentile'] * 100:.1f}%" if inds.get("pe_percentile") is not None else "N/A", None,
+                         "60日均线",    _fmt(inds.get("ma60"), "{:.3f}"), None),
+                        ("市净率 (PB)", _fmt(inds.get("pb")), 'pb',
+                         "120日均线",   _fmt(inds.get("ma120"), "{:.3f}"), None),
+                        ("ROE",         f"{inds['roe'] * 100:.2f}%" if inds.get("roe") is not None else "N/A", 'roe',
+                         "成交额", _fmt(inds.get("amount"), "{:.0f}"), 'amount'),
+                    ]
+                    # 最后一行只有右侧指标（20日均成交额不可点击）
+                    last_row = (None, None, None, "20日均成交额", _fmt(inds.get("amount_ma20"), "{:.0f}"), None)
 
                 for label_a, val_a, key_a, label_b, val_b, key_b in metric_rows + [last_row]:
                     mc_a, mb_a, mc_b, mb_b = st.columns([0.37, 0.13, 0.37, 0.13])
@@ -488,9 +501,11 @@ def render_card_expander(card: dict, expanded: bool = False):
                                     render_trend_chart(code, key_b, label_b)
 
                 # 技术因子入口（idx_factor_pro 专业版数据，弹窗展示最新交易日全部因子）
-                with st.popover("🔬 技术因子", use_container_width=True,
-                                help="查看该指数最新交易日的全部技术面因子（MACD/KDJ/RSI/BOLL 等）"):
-                    render_factor_panel(code)
+                # 国际指数无技术因子数据，不展示入口
+                if card.get('category') != 'global':
+                    with st.popover("🔬 技术因子", use_container_width=True,
+                                    help="查看该指数最新交易日的全部技术面因子（MACD/KDJ/RSI/BOLL 等）"):
+                        render_factor_panel(code)
 
             # ===== 右列：操作建议 → 分析 → 置信度 =====
             with col_right:
@@ -547,11 +562,11 @@ if st.session_state.get("inspection_active", False):
 
 # --- 侧边栏：基金池管理 ---
 st.sidebar.header("⚙️ 监控池管理")
-st.sidebar.subheader("添加行业指数")
-st.sidebar.caption("数据来源：中证申万证券行业指数")
+st.sidebar.subheader("添加监控标的")
+st.sidebar.caption("数据来源：Tushare（申万行业指数 + 国际指数）")
 
-# 选择模式：搜索 vs 分类浏览
-select_mode = st.sidebar.radio("选择方式", ["搜索", "分类浏览"], horizontal=True, label_visibility="collapsed")
+# 选择模式：搜索 / 分类浏览 / 国际指数
+select_mode = st.sidebar.radio("选择方式", ["搜索", "分类浏览", "国际指数"], horizontal=True, label_visibility="collapsed")
 
 selected_industry = None
 
@@ -581,6 +596,35 @@ if select_mode == "搜索":
         st.sidebar.warning("未找到匹配的行业，请尝试其他关键词")
     else:
         st.sidebar.caption("请输入行业名称或代码进行搜索")
+
+elif select_mode == "国际指数":
+    # 静态 21 个国际指数（GLOBAL_INDEX_MAP），支持关键词过滤
+    search_keyword = st.sidebar.text_input("搜索国际指数", placeholder="输入名称或代码，如 恒生 / HSI...")
+
+    if search_keyword:
+        filtered_global = [
+            (c, n) for c, n in GLOBAL_INDEX_MAP.items()
+            if search_keyword.lower() in n.lower() or search_keyword.lower() in c.lower()
+        ]
+    else:
+        filtered_global = list(GLOBAL_INDEX_MAP.items())
+
+    if filtered_global:
+        global_labels = [f"{n} ({c})" for c, n in filtered_global]
+        selected_idx = st.sidebar.selectbox(
+            "国际指数列表",
+            range(len(filtered_global)),
+            format_func=lambda x: global_labels[x]
+        )
+        g_code, g_name = filtered_global[selected_idx]
+        selected_industry = {
+            'index_code': g_code,
+            'industry_name': g_name,
+            'level': 'GLOBAL',
+            'is_global': True,
+        }
+    else:
+        st.sidebar.warning("未找到匹配的国际指数，请尝试其他关键词")
 
 else:
     # 分类浏览：L1 → L2 → L3 级联选择
@@ -641,32 +685,40 @@ else:
 if selected_industry:
     new_code = selected_industry['index_code']
     new_name = selected_industry['industry_name']
-    
-    # 策略分类选择（根据行业层级给出默认建议）
     level = selected_industry.get('level', 'L1')
-    category_options = [
-        ("wide_base", "宽基指数 (沪深300/标普500)"),
-        ("tech_growth", "科技成长 (计算机/半导体)"),
-        ("cycle_mfg", "周期制造 (新能源/煤炭)"),
-        ("dividend", "稳健收息 (红利低波)")
-    ]
-    new_cat = st.sidebar.selectbox("选择所属领域", category_options, format_func=lambda x: x[1])
-    
-    # 显示选中的行业信息
-    st.sidebar.info(f"已选择: {new_name} ({new_code})\n层级: {level}")
-    
-    col_add, col_members = st.sidebar.columns(2)
-    with col_add:
-        add_clicked = st.button("添加监控", type="primary", use_container_width=True)
-    with col_members:
-        # 成分数据变化频繁，点击后弹窗实时拉取，不落库
-        if st.button("成分查询", use_container_width=True):
-            show_index_members(new_code, new_name, level)
-    
+    is_global_sel = selected_industry.get('is_global', False)
+
+    if is_global_sel:
+        # 国际指数：固定 global 分类（无估值数据，现有 4 类策略不适用）；
+        # 无成分查询（index_member_all 仅支持申万行业指数）
+        new_cat_key = 'global'
+        st.sidebar.info(f"已选择: {new_name} ({new_code})\n类型: 国际指数")
+        add_clicked = st.sidebar.button("添加监控", type="primary", use_container_width=True)
+    else:
+        # 策略分类选择（根据行业层级给出默认建议）
+        category_options = [
+            ("wide_base", "宽基指数 (沪深300/标普500)"),
+            ("tech_growth", "科技成长 (计算机/半导体)"),
+            ("cycle_mfg", "周期制造 (新能源/煤炭)"),
+            ("dividend", "稳健收息 (红利低波)")
+        ]
+        new_cat_key = st.sidebar.selectbox("选择所属领域", category_options, format_func=lambda x: x[1])[0]
+
+        # 显示选中的行业信息
+        st.sidebar.info(f"已选择: {new_name} ({new_code})\n层级: {level}")
+
+        col_add, col_members = st.sidebar.columns(2)
+        with col_add:
+            add_clicked = st.sidebar.button("添加监控", type="primary", use_container_width=True)
+        with col_members:
+            # 成分数据变化频繁，点击后弹窗实时拉取，不落库
+            if st.sidebar.button("成分查询", use_container_width=True):
+                show_index_members(new_code, new_name, level)
+
     if add_clicked:
         # category 为指数级全局属性：他人已监控时强制沿用已有分类，
         # 避免同一指数多策略框架导致共享巡检结果互相覆写
-        chosen_cat = new_cat[0]
+        chosen_cat = new_cat_key
         shared_cat = get_shared_category(new_code)
         if shared_cat is not None and shared_cat != chosen_cat:
             st.sidebar.info(
@@ -937,6 +989,7 @@ with tab1:
                 'code': code,
                 'name': name,
                 'date': today_str,
+                'category': cat,
                 'icon': style['icon'],
                 'color': style['color'],
                 'border': style['border'],
@@ -1061,6 +1114,9 @@ with tab2:
                 
                 # 展开详情
                 with st.expander(f"查看详情 - {record['fund_name']} ({record['inspect_date']})", expanded=True):
+                    # 国际指数按代码表判断市场类型（巡检记录表无 category 列，兼容旧记录）
+                    is_global_rec = is_global_code(record['fund_code'])
+
                     # 展示行情数据（来自 daily_market_data，优先匹配巡检日期，失败回退到最新可用数据）
                     market_data = get_market_data_for_date(record['fund_code'], record['inspect_date'])
                     fallback_used = False
@@ -1072,17 +1128,29 @@ with tab2:
                         if fallback_used:
                             actual_date = market_data.get('trade_date', '?')
                             st.caption(f"⚠️ 巡检日期 ({record['inspect_date']}) 无行情数据，展示最新可用数据 (交易日: {actual_date})")
-                        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                        col_m1.metric("收盘价", f"{market_data.get('close_price', 'N/A')}")
-                        col_m2.metric("PE", f"{market_data.get('pe', 'N/A')}")
-                        col_m3.metric("PB", f"{market_data.get('pb', 'N/A')}")
-                        col_m4.metric("无风险利率", f"{market_data.get('risk_free_rate', 'N/A')}")
-                    else:
-                        is_open, _ = is_trade_day(record['inspect_date'])
-                        if not is_open:
-                            st.caption("当日为非交易日（周末或节假日），无行情数据")
+                        if is_global_rec:
+                            # 国际指数无估值数据：展示价格与涨跌幅
+                            pct = market_data.get('pct_change')
+                            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                            col_m1.metric("收盘价", f"{market_data.get('close_price', 'N/A')}")
+                            col_m2.metric("当日涨跌幅", f"{pct:.2f}%" if pct is not None else "N/A")
+                            col_m3.metric("最高价", f"{market_data.get('high_price', 'N/A')}")
+                            col_m4.metric("最低价", f"{market_data.get('low_price', 'N/A')}")
                         else:
+                            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                            col_m1.metric("收盘价", f"{market_data.get('close_price', 'N/A')}")
+                            col_m2.metric("PE", f"{market_data.get('pe', 'N/A')}")
+                            col_m3.metric("PB", f"{market_data.get('pb', 'N/A')}")
+                            col_m4.metric("无风险利率", f"{market_data.get('risk_free_rate', 'N/A')}")
+                    else:
+                        if is_global_rec:
                             st.caption("该指数暂无任何行情数据（可能尚未同步）")
+                        else:
+                            is_open, _ = is_trade_day(record['inspect_date'])
+                            if not is_open:
+                                st.caption("当日为非交易日（周末或节假日），无行情数据")
+                            else:
+                                st.caption("该指数暂无任何行情数据（可能尚未同步）")
 
                     # 展示计算指标（来自 inspection_log，巡检时实时计算并入库）
                     st.markdown("**📐 计算指标**")
@@ -1092,15 +1160,21 @@ with tab2:
                     ma120 = record.get('ma120')
                     has_calc = any(v is not None for v in [pe_pct, pb_pct, ma60, ma120])
                     if has_calc:
-                        col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-                        pe_pct_str = f"{pe_pct * 100:.1f}%" if pe_pct is not None else "N/A"
-                        pb_pct_str = f"{pb_pct * 100:.1f}%" if pb_pct is not None else "N/A"
                         ma60_str = f"{ma60:.3f}" if ma60 is not None else "N/A"
                         ma120_str = f"{ma120:.3f}" if ma120 is not None else "N/A"
-                        col_c1.metric("PE 历史分位", pe_pct_str)
-                        col_c2.metric("PB 历史分位", pb_pct_str)
-                        col_c3.metric("60日均线", ma60_str)
-                        col_c4.metric("120日均线", ma120_str)
+                        if is_global_rec:
+                            # 国际指数无 PE/PB 分位，仅展示均线
+                            col_c1, col_c2 = st.columns(2)
+                            col_c1.metric("60日均线", ma60_str)
+                            col_c2.metric("120日均线", ma120_str)
+                        else:
+                            col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                            pe_pct_str = f"{pe_pct * 100:.1f}%" if pe_pct is not None else "N/A"
+                            pb_pct_str = f"{pb_pct * 100:.1f}%" if pb_pct is not None else "N/A"
+                            col_c1.metric("PE 历史分位", pe_pct_str)
+                            col_c2.metric("PB 历史分位", pb_pct_str)
+                            col_c3.metric("60日均线", ma60_str)
+                            col_c4.metric("120日均线", ma120_str)
                     else:
                         st.caption("该记录为旧版数据，无计算指标（请重新巡检以生成）")
                     
@@ -1139,6 +1213,11 @@ with tab3:
             name = fund['fund_name']
             cat = fund['category']
 
+            # 按分类选择指标分组与默认勾选（国际指数无估值指标，仅价格与趋势类）
+            is_global_fund = cat == 'global'
+            prompt_groups = GLOBAL_INDICATOR_GROUPS if is_global_fund else INDICATOR_GROUPS
+            all_meta_keys = [key for _, keys in prompt_groups for key in keys]
+
             # 当前配置状态（仅当前用户）
             current_prompt = get_custom_prompt(username, code)
             if current_prompt:
@@ -1151,7 +1230,7 @@ with tab3:
                 "提示词内容",
                 value=current_prompt or "",
                 height=280,
-                max_chars=2000,
+                max_chars=8000,
                 placeholder="在此输入专属分析框架，例如：\n该指数属于消费行业，侧重分析 ROE 稳定性和现金流质量...\n\n留空则使用系统默认策略。",
                 key=f"prompt_editor_{username}_{code}",
                 help="提示词将替换 AI 分析中的「估值解读框架」段落。系统红线（只能基于数据解读、不做预测、不改变决策）始终生效。"
@@ -1159,19 +1238,22 @@ with tab3:
 
             # 指标勾选
             st.markdown("**📊 传递给 AI 的指标**")
-            st.caption("勾选需要的指标，AI 将只看到选中项。默认仅选 PE、PB。")
+            if is_global_fund:
+                st.caption("勾选需要的指标，AI 将只看到选中项。国际指数默认传递价格、价格历史分位、均线与当日涨跌幅。")
+            else:
+                st.caption("勾选需要的指标，AI 将只看到选中项。默认仅选 PE、PB。")
 
             saved_indicators = get_selected_indicators(username, code)
-            default_checked = saved_indicators if saved_indicators else ["pe", "pb"]
+            default_checked = saved_indicators if saved_indicators else default_indicators_for(cat)
 
             if st.button("☑️ 全选", key=f"select_all_{username}_{code}", use_container_width=True):
-                for key in INDICATOR_META:
+                for key in all_meta_keys:
                     st.session_state[f"ind_{username}_{code}_{key}"] = True
                 st.rerun()
 
             # 按分组展示指标 checkboxes
             selected_keys = []
-            for group_label, group_keys in INDICATOR_GROUPS:
+            for group_label, group_keys in prompt_groups:
                 cols = st.columns(len(group_keys))
                 for i, key in enumerate(group_keys):
                     label = INDICATOR_META[key][0]
@@ -1183,9 +1265,9 @@ with tab3:
                     if checked:
                         selected_keys.append(key)
 
-            # 如果没有勾选任何指标，默认全部
+            # 如果没有勾选任何指标，默认全部（按分类清单）
             if not selected_keys:
-                selected_keys = list(INDICATOR_META.keys())
+                selected_keys = all_meta_keys
 
             col_btn1, col_btn2 = st.columns([1, 1])
             with col_btn1:
@@ -1211,5 +1293,5 @@ with tab3:
             - 提示词将**替换**系统默认的「第二步：分类定价逻辑」段落，第一/三/四步保持不变
             - 系统**绝对红线**（只能基于量化数据解读、语气冷静客观、不改变决策动作）始终生效，不可覆盖
             - 建议关注：该指数的估值锚点（PE/PB/ROE）、行业特性、需要特别注意的风险维度
-            - 最多 2000 字符，保存后下次巡检自动生效
+            - 最多 8000 字符，保存后下次巡检自动生效
             """)

@@ -481,7 +481,7 @@ def calculate_percentile(fund_code: str, indicator: str, current_value: float, l
     利用 SQL 计算指定指标（如 PE, PB）的历史分位数。
     lookback_days 默认 2500，约等于10个交易年。
     """
-    if current_value is None or indicator not in ['pe', 'pb']:
+    if current_value is None or indicator not in ['pe', 'pb', 'close_price']:
         return None
                 
     conn = get_connection()

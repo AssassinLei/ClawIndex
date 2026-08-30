@@ -38,6 +38,8 @@ INDICATOR_META: dict = {
     "ma120":          ("120日均线",            lambda v: f"{v:.3f}" if v is not None else None),
     "amount":         ("成交额 (万元)",         lambda v: f"{v:.0f}" if v is not None else None),
     "amount_ma20":    ("20日均成交额",          lambda v: f"{v:.0f}" if v is not None else None),
+    "price_percentile": ("价格历史分位",        lambda v: f"{v*100:.2f}%" if v is not None else None),
+    "pct_chg":        ("当日涨跌幅",             lambda v: f"{v:.2f}%" if v is not None else None),
 }
 
 # 指标分组（用于 user_prompt 中按类别展示）
@@ -49,12 +51,38 @@ INDICATOR_GROUPS = [
 # 未配置指标筛选时的默认指标（与 UI 默认勾选一致）
 DEFAULT_INDICATORS = ["pe", "pb"]
 
+# 国际指数专属：指标分组与默认指标（无 PE/PB 估值，仅价格与趋势类指标）
+GLOBAL_INDICATOR_GROUPS = [
+    ("价格与趋势", ["price", "price_percentile", "ma60", "ma120"]),
+    ("当日表现", ["pct_chg"]),
+]
+GLOBAL_DEFAULT_INDICATORS = ["price", "price_percentile", "ma60", "ma120", "pct_chg"]
 
-def _build_indicators_text(inds: dict, selected: list[str] | None) -> str:
+
+def default_indicators_for(category: str) -> list[str]:
+    """按策略分类返回未配置时的默认传递指标。
+
+    scheduler 签名归一化与 app.py 提示词默认勾选共用本函数，
+    保证「未配置用户」与「显式勾选默认指标的用户」归一化后合并为同一组（LLM 去重不破）。
+    """
+    if category == 'global':
+        return GLOBAL_DEFAULT_INDICATORS
+    return DEFAULT_INDICATORS
+
+
+def indicator_groups_for(category: str) -> list:
+    """按策略分类返回指标展示分组（提示词勾选 UI 与 user_prompt 生成共用）"""
+    if category == 'global':
+        return GLOBAL_INDICATOR_GROUPS
+    return INDICATOR_GROUPS
+
+
+def _build_indicators_text(inds: dict, selected: list[str] | None, groups: list | None = None) -> str:
     """按用户勾选的指标和分组，构建 user_prompt 中的指标展示文本"""
     keys = selected if selected else DEFAULT_INDICATORS
+    groups = groups if groups is not None else INDICATOR_GROUPS
     lines = []
-    for group_label, group_keys in INDICATOR_GROUPS:
+    for group_label, group_keys in groups:
         parts = []
         for key in group_keys:
             if key not in keys:
@@ -100,6 +128,12 @@ CATEGORY_STRATEGIES = {
         "稳健收息策略：侧重PB分位与PE绝对值，兼顾股息率与国债收益率利差。"
         "PB分位低于50%且PE低于15为合理估值区间，提供充分安全垫。"
         "价格跌破MA120时趋势向下，仅适合定投不宜单笔大额加仓。"
+    ),
+    "global": (
+        "国际指数趋势跟踪策略：以双均线趋势为核心，不依赖估值指标。"
+        "价格站上MA60且MA60高于MA120（多头排列）为买入/持有信号。"
+        "价格跌破MA60或MA60下穿MA120为减仓/卖出信号。"
+        "价格历史分位辅助判断当前价格在近10年区间的高低位置，分位越高追高风险越大。"
     ),
 }
 
@@ -209,8 +243,9 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
     # 构建 System Prompt
     system_prompt = _build_system_prompt(cat, custom_prompt)
 
-    # 构建 User Prompt（动态按勾选指标生成）
-    indicators_text = _build_indicators_text(inds, selected_indicators)
+    # 构建 User Prompt（动态按勾选指标与分类分组生成）
+    effective_selected = selected_indicators or default_indicators_for(cat)
+    indicators_text = _build_indicators_text(inds, effective_selected, groups=indicator_groups_for(cat))
     if selected_indicators:
         logger.info(f"generate_ai_report: {code} 已筛选指标 {selected_indicators}")
 

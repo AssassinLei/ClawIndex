@@ -8,6 +8,7 @@ from database import (
     save_daily_data, get_connection, get_latest_trade_date, save_industry_list,
     save_idx_factor_data, get_latest_factor_trade_date, IDX_FACTOR_COLUMNS,
 )
+from constants import GLOBAL_INDEX_MAP
 from logger import setup_logger
 
 logger = setup_logger("data_fetcher")
@@ -29,6 +30,15 @@ def _get_pro():
         ts.set_token(token)
         _pro = ts.pro_api()
     return _pro
+
+def is_global_code(fund_code: str) -> bool:
+    """判断 fund_code 是否为国际指数（index_global 接口标的）。
+
+    市场类型识别唯一依据是静态代码表 GLOBAL_INDEX_MAP：
+    国际指数无 PE/PB 估值、无技术因子、SSE 交易日历不适用，
+    数据抓取/增量同步/因子同步均据此分支。
+    """
+    return fund_code in GLOBAL_INDEX_MAP
 
 # 交易日历缓存（避免重复查询）
 _trade_cal_cache = {}
@@ -228,6 +238,56 @@ def fetch_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[
         logger.error(error_msg)
         return pd.DataFrame(), error_msg
 
+def fetch_global_history_data(fund_code: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, str]:
+    """
+    获取指定区间的国际指数日线行情（index_global 接口，需 6000 积分）。
+    - 无 PE/PB 估值、无市值、无名称字段：名称取静态代码表，估值列不填
+    - 无无风险利率（无 PE 无法计算风险溢价）
+    返回: (DataFrame, error_message)
+    """
+    try:
+        logger.info(f"index_global 请求: ts_code={fund_code}, start={start_date}, end={end_date}")
+        df = _get_pro().index_global(
+            ts_code=fund_code,
+            start_date=start_date,
+            end_date=end_date,
+            fields='ts_code,trade_date,open,close,high,low,pre_close,change,pct_chg,swing,vol,amount'
+        )
+
+        logger.info(f"index_global 返回: {len(df)} 行")
+        if not df.empty:
+            logger.debug(f"index_global 前3行:\n{df.head(3)}")
+
+        if df.empty:
+            return pd.DataFrame(), (
+                f"index_global 接口返回空数据\n"
+                f"请求参数: ts_code={fund_code}, start_date={start_date}, end_date={end_date}\n"
+                f"可能原因: 1) 标的代码不正确 2) Tushare账户无index_global接口权限（需6000积分） 3) 该区间无行情数据"
+            )
+
+        # 列重命名对齐 daily_market_data 表（swing/pre_close 表无对应列，不落库）
+        df.rename(columns={
+            'ts_code': 'fund_code',
+            'close': 'close_price',
+            'open': 'open_price',
+            'high': 'high_price',
+            'low': 'low_price',
+            'vol': 'volume',
+            'pct_chg': 'pct_change',
+        }, inplace=True)
+        # 接口不返回名称，从静态代码表填充
+        df['name'] = GLOBAL_INDEX_MAP.get(fund_code, fund_code)
+        df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y-%m-%d')
+        df.drop_duplicates(subset=['fund_code', 'trade_date'], inplace=True)
+
+        logger.info(f"fetch_global_history_data: 最终 {len(df)} 行, 日期 {df['trade_date'].min()}~{df['trade_date'].max()}")
+        return df, ""
+
+    except Exception as e:
+        error_msg = f"index_global 接口调用失败: {type(e).__name__}: {str(e)}"
+        logger.error(error_msg)
+        return pd.DataFrame(), error_msg
+
 def fetch_idx_factor(fund_code: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, str]:
     """
     获取指定区间的指数技术面因子数据（idx_factor_pro 专业版）。
@@ -302,39 +362,47 @@ def fetch_index_members(index_code: str, level: str) -> tuple[pd.DataFrame, str]
 def sync_all_history(fund_code: str) -> tuple[bool, str]:
     """
     初始化函数：当在前端添加新基金时，调用此函数拉取过去 10 年的数据落库。
+    按市场类型分支：国际指数走 index_global，申万行业指数走 sw_daily。
     返回: (success: bool, message: str)
     """
     end = datetime.now()
     start = end - timedelta(days=365 * 10) # 10年
     start_str = start.strftime('%Y%m%d')
     end_str = end.strftime('%Y%m%d')
-    
+
     logger.info(f"sync_all_history: 开始同步 {fund_code}, {start_str}~{end_str}")
-    
-    df, error = fetch_history_data(fund_code, start_str, end_str)
-    
+
+    if is_global_code(fund_code):
+        df, error = fetch_global_history_data(fund_code, start_str, end_str)
+    else:
+        df, error = fetch_history_data(fund_code, start_str, end_str)
+
     if error:
         logger.error(f"sync_all_history: 失败 - {error}")
         return False, error
-    
+
     if df.empty:
         logger.error(f"sync_all_history: 失败 - 未获取到任何数据")
         return False, f"标的 {fund_code} 未获取到任何数据"
-    
+
     save_daily_data(df)
     msg = f"成功同步 {fund_code} 共 {len(df)} 条历史数据（{df['trade_date'].min()} ~ {df['trade_date'].max()}）"
     logger.info(f"sync_all_history: {msg}")
-    
-    # 同步技术因子（失败不阻断主流程，巡检时会自动重试补齐）
-    df_factor, factor_error = fetch_idx_factor(fund_code, start_str, end_str)
-    if factor_error:
-        logger.warning(f"sync_all_history: 技术因子同步失败（不影响行情数据）- {factor_error}")
-        msg += "；技术因子同步失败，将在巡检时自动重试"
+
+    if is_global_code(fund_code):
+        # 国际指数无 idx_factor_pro 技术因子数据，跳过
+        logger.info(f"sync_all_history: {fund_code} 为国际指数，无技术因子数据，跳过因子同步")
     else:
-        save_idx_factor_data(df_factor)
-        msg += f"；技术因子 {len(df_factor)} 条"
-        logger.info(f"sync_all_history: {fund_code} 技术因子同步 {len(df_factor)} 条")
-    
+        # 同步技术因子（失败不阻断主流程，巡检时会自动重试补齐）
+        df_factor, factor_error = fetch_idx_factor(fund_code, start_str, end_str)
+        if factor_error:
+            logger.warning(f"sync_all_history: 技术因子同步失败（不影响行情数据）- {factor_error}")
+            msg += "；技术因子同步失败，将在巡检时自动重试"
+        else:
+            save_idx_factor_data(df_factor)
+            msg += f"；技术因子 {len(df_factor)} 条"
+            logger.info(f"sync_all_history: {fund_code} 技术因子同步 {len(df_factor)} 条")
+
     # 必须休眠防止 Tushare 限流封号
     time.sleep(2)
     return True, msg
@@ -343,7 +411,11 @@ def _sync_factor_incremental(fund_code: str, today: str):
     """
     技术因子增量补齐（独立于行情同步判断缺口）。
     失败仅记录日志，不影响巡检主流程。
+    国际指数无 idx_factor_pro 数据，直接跳过。
     """
+    if is_global_code(fund_code):
+        return
+
     factor_latest = get_latest_factor_trade_date(fund_code)
     
     if factor_latest is None:
@@ -409,19 +481,21 @@ def _sync_market_incremental(fund_code: str) -> tuple[bool, str]:
     if latest_date_clean >= today:
         return True, f"数据已是最新（最新日期: {latest_date}）"
     
-    # 使用交易日历判断今天是否可交易
-    is_open, prev_trade_day = is_trade_day(today)
-    if not is_open:
-        reason = f"今天({today})非交易日" if weekday < 5 else f"今天是{weekday_names[weekday]}"
-        last_date = prev_trade_day if prev_trade_day else latest_date
-        return True, f"{reason}，股市休市，数据已是最新（最新日期: {last_date}）"
+    # 使用交易日历判断今天是否可交易（国际指数不适用 SSE 日历，直接尝试拉取，
+    # 接口返回空即视为今日行情尚未发布，由下方空数据分支容错）
+    if not is_global_code(fund_code):
+        is_open, prev_trade_day = is_trade_day(today)
+        if not is_open:
+            reason = f"今天({today})非交易日" if weekday < 5 else f"今天是{weekday_names[weekday]}"
+            last_date = prev_trade_day if prev_trade_day else latest_date
+            return True, f"{reason}，股市休市，数据已是最新（最新日期: {last_date}）"
     
     # 从最新日期的下一天开始拉取
     start = (datetime.strptime(latest_date_clean, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
     logger.info(f"_sync_market_incremental: {fund_code} 增量拉取 {start}~{today}")
     
-    df, error = fetch_history_data(fund_code, start, today)
-    
+    df, error = fetch_global_history_data(fund_code, start, today) if is_global_code(fund_code) else fetch_history_data(fund_code, start, today)
+
     if error:
         # 如果是空数据且不是接口异常，说明今天还没有新行情（如节假日）
         if '接口返回空数据' in error:

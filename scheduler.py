@@ -19,9 +19,9 @@ from database import (
     get_webhook_urls, get_setting, set_setting, get_user_setting,
     get_prompt_configs_for_users,
 )
-from data_fetcher import is_trade_day
+from data_fetcher import is_trade_day, is_global_code
 from inspection_pipeline import prepare_fund_data, analyze_and_save_for_user
-from llm_agent import generate_ai_report, DEFAULT_INDICATORS
+from llm_agent import generate_ai_report, default_indicators_for
 from webhook_sender import send_to_all_webhooks, is_action_pushable
 
 logger = setup_logger("scheduler")
@@ -69,6 +69,7 @@ def run_scheduled_inspection():
         sync_error_count = 0
         pipeline_error_count = 0
         ai_fail_count = 0  # AI 调用失败而跳过入库/推送的用户次数
+        today_str = datetime.now().strftime("%Y%m%d")
 
         # 循环外一次性构建推送路由映射，避免每只标的重复查库：
         # watchers_map: fund_code → 监控用户列表
@@ -85,6 +86,13 @@ def run_scheduled_inspection():
             code = fund["fund_code"]
             name = fund["fund_name"]
             cat = fund["category"]
+            # 标的级日历门控：A 股标的按 SSE 日历跳过休市日（避免节假日用陈旧数据重复研判/推送）；
+            # 国际指数不适用 SSE 日历，恒执行（增量同步的空数据容错负责「市场休市日」）
+            if not is_global_code(code):
+                is_open, _ = is_trade_day(today_str)
+                if not is_open:
+                    logger.info(f"定时巡检: {name} ({code}) 今日 A 股休市，跳过")
+                    continue
             logger.info(f"定时巡检: [{success_count + sync_error_count + pipeline_error_count + 1}/{total}] {name} ({code})")
 
             try:
@@ -108,8 +116,8 @@ def run_scheduled_inspection():
 
                 for user in watchers:
                     custom_prompt, selected_indicators = configs.get(user, (None, []))
-                    # 归一化：空配置与显式勾选默认指标的 Prompt 完全一致，统一按默认指标处理
-                    effective_inds = selected_indicators or DEFAULT_INDICATORS
+                    # 归一化：空配置与显式勾选默认指标的 Prompt 完全一致，统一按分类默认指标处理
+                    effective_inds = selected_indicators or default_indicators_for(cat)
                     signature = (custom_prompt, tuple(sorted(effective_inds)))
                     ai_result = group_cache.get(signature)
                     if ai_result is None:
@@ -176,7 +184,16 @@ def run_scheduled_inspection():
 
 
 def _should_run_today() -> bool:
-    """检查今天是否为交易日（二次确认，跳过法定节假日）"""
+    """检查今天是否存在需要巡检的标的（法定节假日二次确认）。
+
+    国际指数跳过 SSE 日历（美/欧/日/港交易日历与中国不一致），监控池含国际指数
+    即可运行整轮；A 股标的的休市跳过下沉到 run_scheduled_inspection 的标的级判断。
+    """
+    funds = get_distinct_funds()
+    if not funds:
+        return False
+    if any(is_global_code(f["fund_code"]) for f in funds):
+        return True
     today = datetime.now().strftime("%Y%m%d")
     is_open, _ = is_trade_day(today)
     if not is_open:
