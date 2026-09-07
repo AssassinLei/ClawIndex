@@ -633,10 +633,11 @@ if selected_industry:
 
         col_add, col_members = st.sidebar.columns(2)
         with col_add:
-            add_clicked = st.sidebar.button("添加监控", type="primary", use_container_width=True)
+            add_clicked = st.button("添加监控", type="primary", use_container_width=True)
         with col_members:
             # 成分数据变化频繁，点击后弹窗实时拉取，不落库
-            if st.sidebar.button("成分查询", use_container_width=True):
+            # 显式 key：与监控列表区的同名按钮结构相同，避免 Streamlit 内部 key 冲突
+            if st.button("成分查询", use_container_width=True, key="members_query_add"):
                 show_index_members(new_code, new_name, level)
 
     if add_clicked:
@@ -685,14 +686,29 @@ if funds:
     df_display['领域'] = df_display['领域'].map(CATEGORY_NAMES)
     st.sidebar.dataframe(df_display, hide_index=True)
     
-    # 操作对象选择：删除与趋势查看共用同一选择框
+    # 操作对象选择：删除、成分查询与趋势查看共用同一选择框
     fund_name_to_code = {f['fund_name']: f['fund_code'] for f in funds}
     selected_name = st.sidebar.selectbox("选择要操作的指数", list(fund_name_to_code.keys()))
-    if st.sidebar.button("删除所选指数"):
-        del_code = fund_name_to_code[selected_name]
-        remove_fund(username, del_code)
-        st.sidebar.warning(f"已删除 {selected_name}")
-        st.rerun()
+    # 行业层级映射：成分查询需按 level 传参（index_member_all 仅支持申万行业指数，国际指数不在表中）
+    industry_level_map = {ind['index_code']: ind['level'] for ind in industries}
+    col_del, col_members = st.sidebar.columns(2)
+    with col_del:
+        # 注意：列内必须用 st.button()，st.sidebar.button() 会绕过列上下文导致按钮堆叠
+        # type="primary" 使用主题色（默认红色），与「添加监控」按钮一致
+        if st.button("删除所选指数", type="primary", use_container_width=True):
+            del_code = fund_name_to_code[selected_name]
+            remove_fund(username, del_code)
+            st.sidebar.warning(f"已删除 {selected_name}")
+            st.rerun()
+    with col_members:
+        # 成分数据变化频繁，弹窗实时拉取，不落库（复用添加区已有的成分查询弹窗）
+        if st.button("成分查询", use_container_width=True, key="members_query_pool"):
+            code = fund_name_to_code[selected_name]
+            level = industry_level_map.get(code)
+            if level is None:
+                st.sidebar.warning("该指数无成分股数据（国际指数不支持成分查询）")
+            else:
+                show_index_members(code, selected_name, level)
     # 价格趋势：复用同一选中项，弹窗展示每日收盘价走势
     if st.sidebar.button("查看指数价格趋势", use_container_width=True):
         show_price_trend(fund_name_to_code[selected_name], selected_name)
