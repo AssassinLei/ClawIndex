@@ -327,6 +327,13 @@ def render_trend_chart(fund_code: str, indicator_key: str, title: str):
     st.caption(f"共 {len(chart_df)} 个交易日 · {chart_df.index[0]} ~ {chart_df.index[-1]}")
 
 
+@st.dialog("指数价格趋势", width="large")
+def show_price_trend(index_code: str, index_name: str):
+    """弹窗展示指数的每日收盘价趋势（复用 render_trend_chart 组件）。"""
+    st.caption(f"{index_name} ({index_code}) · 每日收盘价")
+    render_trend_chart(index_code, 'close_price', "收盘价")
+
+
 # --- 巡检卡片渲染辅助函数 ---
 def render_card_header(card: dict):
     """渲染巡检卡片的彩色标题栏"""
@@ -678,14 +685,17 @@ if funds:
     df_display['领域'] = df_display['领域'].map(CATEGORY_NAMES)
     st.sidebar.dataframe(df_display, hide_index=True)
     
-    # 删除功能：显示名称，但用代码删除
+    # 操作对象选择：删除与趋势查看共用同一选择框
     fund_name_to_code = {f['fund_name']: f['fund_code'] for f in funds}
-    selected_name = st.sidebar.selectbox("选择要删除的指数", list(fund_name_to_code.keys()))
+    selected_name = st.sidebar.selectbox("选择要操作的指数", list(fund_name_to_code.keys()))
     if st.sidebar.button("删除所选指数"):
         del_code = fund_name_to_code[selected_name]
         remove_fund(username, del_code)
         st.sidebar.warning(f"已删除 {selected_name}")
         st.rerun()
+    # 价格趋势：复用同一选中项，弹窗展示每日收盘价走势
+    if st.sidebar.button("查看指数价格趋势", use_container_width=True):
+        show_price_trend(fund_name_to_code[selected_name], selected_name)
 else:
     st.sidebar.info("监控池为空，请先添加基金。")
 
