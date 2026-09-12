@@ -76,6 +76,30 @@ def _norm_date(date_str: str) -> str:
     return s
 
 
+# --- 持仓状态（「用户 × 指数」维度，仅本人可见/生效） ---
+# 合法值域（含端点）：仓位比例 0~1（相对个人目标仓位的完成度）；浮盈浮亏 -1~+10（即 -100%~+1000%）
+POSITION_RATIO_RANGE = (0.0, 1.0)
+PNL_RATIO_RANGE = (-1.0, 10.0)
+
+
+def normalize_position(position_ratio, unrealized_pnl_ratio) -> tuple[float, float]:
+    """归一化持仓为决策上下文的**唯一口径**（纯函数）。
+
+    - position_ratio 为 None 或 ≤ 0 → (0.0, 0.0)：空仓；无持仓即无盈亏，填写的盈亏被忽略
+    - 否则 → (round(pos, 4), round(pnl, 4))
+
+    跨三处共用：Prompt 数据行注入 / 巡检快照写库 / 调度 LLM 去重签名。
+    任何一处绕过本函数即视为缺陷。
+    """
+    pos = safe_float(position_ratio)
+    if pos is None or pos <= 0:
+        return (0.0, 0.0)
+    pnl = safe_float(unrealized_pnl_ratio)
+    if pnl is None:
+        pnl = 0.0
+    return (round(pos, 4), round(pnl, 4))
+
+
 def get_connection():
     # 确保返回的行是字典格式，方便读取字段
     conn = sqlite3.connect(DB_NAME)
@@ -159,6 +183,8 @@ def init_db():
                 ma120 REAL,
                 amount REAL,
                 amount_ma20 REAL,
+                position_ratio REAL,          -- 巡检时点持仓快照（归一化值；未填报/空仓=0.0）
+                unrealized_pnl_ratio REAL,    -- 巡检时点浮盈浮亏快照（同上）
                 UNIQUE(username, fund_code, inspect_date)
             )
         ''')
@@ -210,6 +236,18 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
                 created_at DATE DEFAULT (date('now', 'localtime'))
+            )
+        ''')
+
+        # 表10：用户持仓状态（「用户 × 指数」唯一当前状态，仅本人可见/生效）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_position (
+                username TEXT NOT NULL,
+                fund_code TEXT NOT NULL,
+                position_ratio REAL NOT NULL,          -- 仓位比例（相对个人目标仓位的完成度），0~1
+                unrealized_pnl_ratio REAL NOT NULL,    -- 浮盈浮亏比例，-1~+10
+                updated_at DATE DEFAULT (date('now', 'localtime')),
+                PRIMARY KEY (username, fund_code)
             )
         ''')
         
@@ -308,12 +346,13 @@ def add_fund(username: str, fund_code: str, fund_name: str, category: str) -> bo
         conn.close()
 
 def remove_fund(username: str, fund_code: str):
-    """将指数移出指定用户的监控池；提示词随本用户删除，行情/因子仅当无人监控时清理"""
+    """将指数移出指定用户的监控池；提示词与持仓状态随本用户删除，行情/因子仅当无人监控时清理"""
     conn = get_connection()
     try:
-        # 1. 删除本用户的监控关系与其专属提示词
+        # 1. 删除本用户的监控关系、专属提示词与持仓状态
         conn.execute("DELETE FROM fund_pool WHERE username = ? AND fund_code = ?", (username, fund_code))
         conn.execute("DELETE FROM fund_custom_prompts WHERE username = ? AND fund_code = ?", (username, fund_code))
+        conn.execute("DELETE FROM user_position WHERE username = ? AND fund_code = ?", (username, fund_code))
         # 2. 检查是否仍有其他用户监控该指数
         remaining = conn.execute(
             "SELECT COUNT(*) FROM fund_pool WHERE fund_code = ?", (fund_code,)
@@ -368,6 +407,110 @@ def get_fund_watchers_map() -> Dict[str, List[str]]:
         return result
     finally:
         conn.close()
+
+
+# --- 用户持仓状态管理（「用户 × 指数」维度） ---
+def upsert_user_position(username: str, fund_code: str, position_ratio, unrealized_pnl_ratio) -> tuple[bool, str]:
+    """校验并写入用户持仓状态，返回 (是否成功, 提示信息)。
+
+    校验（FR-003 纵深防御，任一不满足 → (False, 原因) 且不写库）：
+      - 两项必须同时填报（任一为空即拒绝）；
+      - 仓位比例 0~1（含端点）；浮盈浮亏 -1~+10（含端点）。
+    """
+    pos = safe_float(position_ratio)
+    pnl = safe_float(unrealized_pnl_ratio)
+    if pos is None or pnl is None:
+        return False, "仓位比例与浮盈浮亏必须同时填写（都填或都不填）"
+    if not (POSITION_RATIO_RANGE[0] <= pos <= POSITION_RATIO_RANGE[1]):
+        return False, f"仓位比例须在 {POSITION_RATIO_RANGE[0]:.0f}~{POSITION_RATIO_RANGE[1]:.0f}（0%~100%）之间"
+    if not (PNL_RATIO_RANGE[0] <= pnl <= PNL_RATIO_RANGE[1]):
+        return False, f"浮盈浮亏须在 {PNL_RATIO_RANGE[0]:.0f}~{PNL_RATIO_RANGE[1]:.0f}（-100%~+1000%）之间"
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_position "
+            "(username, fund_code, position_ratio, unrealized_pnl_ratio, updated_at) "
+            "VALUES (?, ?, ?, ?, date('now', 'localtime'))",
+            (username, fund_code, round(pos, 4), round(pnl, 4)),
+        )
+        conn.commit()
+        logger.info(f"upsert_user_position: [{username}] {fund_code} 仓位={round(pos, 4)} 盈亏={round(pnl, 4)}")
+        return True, "持仓状态已保存"
+    finally:
+        conn.close()
+
+
+def get_user_position(username: str, fund_code: str) -> dict | None:
+    """读取用户对某指数的**原始**持仓状态（UI 回填/展示用）；未填报返回 None。"""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT position_ratio, unrealized_pnl_ratio, updated_at FROM user_position "
+            "WHERE username = ? AND fund_code = ?",
+            (username, fund_code),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "position_ratio": safe_float(row["position_ratio"]),
+            "unrealized_pnl_ratio": safe_float(row["unrealized_pnl_ratio"]),
+            "updated_at": row["updated_at"],
+        }
+    finally:
+        conn.close()
+
+
+def get_user_positions(username: str) -> Dict[str, dict]:
+    """读取该用户全部持仓状态（UI 总览用）；key=fund_code，未填报的指数不出现。"""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "SELECT fund_code, position_ratio, unrealized_pnl_ratio, updated_at "
+            "FROM user_position WHERE username = ?",
+            (username,),
+        )
+        return {
+            row["fund_code"]: {
+                "position_ratio": safe_float(row["position_ratio"]),
+                "unrealized_pnl_ratio": safe_float(row["unrealized_pnl_ratio"]),
+                "updated_at": row["updated_at"],
+            }
+            for row in cursor.fetchall()
+        }
+    finally:
+        conn.close()
+
+
+def get_effective_position(username: str, fund_code: str) -> tuple[float, float]:
+    """读取归一化持仓（流水线用）：未填报/空仓 → (0.0, 0.0)；永不返回 None。"""
+    raw = get_user_position(username, fund_code)
+    if not raw:
+        return (0.0, 0.0)
+    return normalize_position(raw["position_ratio"], raw["unrealized_pnl_ratio"])
+
+
+def get_effective_positions_for_users(fund_code: str, usernames: list[str]) -> Dict[str, tuple[float, float]]:
+    """批量读取多用户对同一指数的归一化持仓（调度器签名用；单 SQL，无 N+1）。
+
+    未填报用户返回 (0.0, 0.0)；usernames 为空时返回 {}。
+    """
+    if not usernames:
+        return {}
+    result: Dict[str, tuple[float, float]] = {u: (0.0, 0.0) for u in usernames}
+    conn = get_connection()
+    try:
+        placeholders = ",".join("?" for _ in usernames)
+        cursor = conn.execute(
+            f"SELECT username, position_ratio, unrealized_pnl_ratio FROM user_position "
+            f"WHERE fund_code = ? AND username IN ({placeholders})",
+            (fund_code, *usernames),
+        )
+        for row in cursor.fetchall():
+            result[row["username"]] = normalize_position(row["position_ratio"], row["unrealized_pnl_ratio"])
+        return result
+    finally:
+        conn.close()
+
 
 # --- 行情数据写入操作 ---
 def save_daily_data(df: pd.DataFrame):
@@ -667,22 +810,30 @@ def save_inspection_result(username: str, fund_code: str, fund_name: str, action
                            pe_percentile: float = None, pb_percentile: float = None,
                            ma60: float = None, ma120: float = None,
                            amount: float = None, amount_ma20: float = None,
-                           confidence: int = None):
-    """保存巡检结果（同一用户同一标的同一天覆盖更新），含计算指标与AI置信度"""
+                           confidence: int = None, position_ratio: float = None,
+                           unrealized_pnl_ratio: float = None):
+    """保存巡检结果（同一用户同一标的同一天覆盖更新），含计算指标、AI 置信度与持仓快照。
+
+    position_ratio / unrealized_pnl_ratio：巡检时点持仓快照（归一化值，未填报=0.0）；
+    旧调用方不传时保持 None（存量旧记录展示层按「空仓」看待）。
+    """
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO inspection_log
                 (username, fund_code, fund_name, action, ai_report, inspect_date,
-                 pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence)
-            VALUES (?, ?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?)
+                 pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence,
+                 position_ratio, unrealized_pnl_ratio)
+            VALUES (?, ?, ?, ?, ?, date('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (username, fund_code, fund_name, action, ai_report,
-              pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence))
+              pe_percentile, pb_percentile, ma60, ma120, amount, amount_ma20, confidence,
+              position_ratio, unrealized_pnl_ratio))
         conn.commit()
         logger.info(
             f"save_inspection_result: [{username}] {fund_code} {fund_name} action={action} "
-            f"PE%={pe_percentile} PB%={pb_percentile} MA60={ma60} MA120={ma120} confidence={confidence}"
+            f"PE%={pe_percentile} PB%={pb_percentile} MA60={ma60} MA120={ma120} confidence={confidence} "
+            f"position={position_ratio} pnl={unrealized_pnl_ratio}"
         )
     finally:
         conn.close()

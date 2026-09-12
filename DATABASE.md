@@ -12,12 +12,12 @@ quant_system.db
 
 ## 设计概览
 
-系统支持多用户（无密码，用户名标识），共 **9 张表**，数据分为两类归属：
+系统支持多用户（无密码，用户名标识），共 **10 张表**，数据分为两类归属：
 
-- **用户维度**（按 `username` 隔离）：监控池 `fund_pool`、Webhook 地址 `webhook_urls`、巡检推送开关（`app_settings` 命名空间键）、定制提示词 `fund_custom_prompts`、巡检结果 `inspection_log`
+- **用户维度**（按 `username` 隔离）：监控池 `fund_pool`、持仓状态 `user_position`、Webhook 地址 `webhook_urls`、巡检推送开关（`app_settings` 命名空间键）、定制提示词 `fund_custom_prompts`、巡检结果 `inspection_log`
 - **全局共享**：行情 `daily_market_data`、技术因子 `idx_factor_data`、行业分类 `industry_list`、定时巡检总开关
 
-同一指数可被多个用户分别监控；行情/因子数据只存一份，删除监控时仅当无其他用户监控才清理共享数据；提示词与巡检结果按用户隔离。
+同一指数可被多个用户分别监控；行情/因子数据只存一份，删除监控时仅当无其他用户监控才清理共享数据；提示词、持仓状态与巡检结果按用户隔离。
 
 表之间通过 `fund_code` 在业务逻辑上关联，**未定义外键约束**。
 
@@ -25,8 +25,13 @@ quant_system.db
 users (username PK)
   ▲ 1:N
 fund_pool (username, fund_code, UNIQUE(username, fund_code))
-        │ N:1 按 fund_code 关联（无外键）
-        ▼
+  │  ├─ 1:1（同键）
+  │  ▼
+  │ user_position (username, fund_code) PK
+  │       当前持仓状态：仓位比例、浮盈浮亏比例（按用户隔离，仅本人可见）
+  │
+  │ N:1 按 fund_code 关联（无外键）
+  ▼
 daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
         行情与因子全局共享，多用户复用同一份
 ```
@@ -112,8 +117,12 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | `pe_percentile` / `pb_percentile` | REAL | 可空 | PE / PB 历史分位 |
 | `ma60` / `ma120` | REAL | 可空 | 60 / 120 日均线 |
 | `amount` / `amount_ma20` | REAL | 可空 | 成交额 / 20 日均成交额 |
+| `position_ratio` | REAL | 可空 | **巡检时点持仓快照**（归一化值；升级后新记录始终写入，未填报=0.0；存量旧记录为 NULL） |
+| `unrealized_pnl_ratio` | REAL | 可空 | **巡检时点浮盈浮亏快照**（同上） |
 
-`UNIQUE(username, fund_code, inspect_date)` + `INSERT OR REPLACE`：同一用户同一标的同一天巡检结果覆盖更新。定时巡检中同一指数每天只同步与计算一次，但按用户提示词配置分组分别调用 AI 并入库。
+`UNIQUE(username, fund_code, inspect_date)` + `INSERT OR REPLACE`：同一用户同一标的同一天巡检结果覆盖更新。定时巡检中同一指数每天只同步与计算一次，但按用户决策上下文（提示词/指标/持仓/盈亏）分组分别调用 AI 并入库。
+
+**持仓快照语义**：快照 ≡ 本次分析实际注入 Prompt 的同一归一化值（不可变，不随用户后续改仓变化；同日覆盖更新随当天最后一次巡检刷新）；升级前旧记录两列为 NULL → 展示/回溯时按「空仓（0%）」看待，不回填、不报错。
 
 ### `webhook_urls` — Webhook 地址（按用户隔离）
 
@@ -157,6 +166,20 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 
 主键 `(username, fund_code)`：同一指数不同用户各自配置，互不影响。
 
+### `user_position` — 用户持仓状态（按用户隔离）
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `username` | TEXT | NOT NULL，联合主键 | 归属用户 |
+| `fund_code` | TEXT | NOT NULL，联合主键 | 标的代码 |
+| `position_ratio` | REAL | NOT NULL | 当前仓位比例 = 相对个人目标仓位的完成度（已投入 ÷ 计划总额），0~1 |
+| `unrealized_pnl_ratio` | REAL | NOT NULL | 浮盈浮亏比例，-1 ~ +10（即 -100% ~ +1000%） |
+| `updated_at` | DATE | DEFAULT 当天本地日期 | 最近更新时间 |
+
+主键 `(username, fund_code)` + `INSERT OR REPLACE`（upsert）。写入前经 `database.upsert_user_position` 校验：两项必须同时填报，缺任一项或越界均拒绝保存（FR-003 纵深防御）。
+
+**语义与口径**：仓位为「用户相对其个人目标仓位的完成度」；系统只负责**如实提供数据**（以数据行注入 AI 的 User Prompt），不内置任何「如何思考持仓/盈亏」的规则（属用户提示词职责）。归一化口径由纯函数 `normalize_position(pos, pnl)` 统一：未填报 / 仓位 ≤0 → `(0.0, 0.0)`（空仓，盈亏忽略），供「Prompt 注入 / 快照写库 / 调度去重签名」三处共用。删除监控指数时随 `remove_fund` 级联清理（历史快照保留）。
+
 ---
 
 ## 数据流
@@ -168,8 +191,10 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | 添加标的 | `app.py` → `add_fund(username, ...)` | `fund_pool` | 同用户重复添加触发唯一约束，静默忽略；他人已监控时强制沿用已有 category |
 | 同步历史数据 | `data_fetcher.py` → `save_daily_data()` / `save_idx_factor_data()` | `daily_market_data` / `idx_factor_data` | 添加标的时拉近 10 年（国际指数走 `index_global` 接口，无因子数据）；行情已存在（他人已同步）则跳过全量拉取，改走 `sync_incremental` 补齐增量 |
 | 增量同步 | 巡检流水线 → `sync_incremental()` | 同上 | 每次巡检前补齐 DB 最新日期到今天的缺口（行情与因子独立判断）；国际指数不依赖 A 股交易日历、跳过因子同步 |
-| 删除标的 | `app.py` → `remove_fund(username, code)` | 多表 | 删本用户监控关系与其专属提示词；无其他用户监控才清理共享行情/因子（巡检记录保留） |
-| 巡检入库 | `inspection_pipeline.py` → `save_inspection_result()` | `inspection_log` | 同用户同标的同日覆盖更新 |
+| 删除标的 | `app.py` → `remove_fund(username, code)` | 多表 | 删本用户监控关系、其专属提示词与持仓状态；无其他用户监控才清理共享行情/因子（巡检记录保留） |
+| 巡检入库 | `inspection_pipeline.py` → `save_inspection_result()` | `inspection_log` | 同用户同标的同日覆盖更新；同时写入巡检时点持仓快照（未填报=0.0） |
+| 持仓录入/更新 | `app.py` tab「持仓管理」 → `upsert_user_position()` | `user_position` | 校验后 upsert，立即生效于其后的巡检 |
+| 持仓读取与注入 | 巡检流水线 → `get_effective_position()`；调度器 → `get_effective_positions_for_users()` | `user_position` | 归一化（未填报→空仓 0%）后以数据行注入 AI 的 User Prompt；快照与分析输入同源 |
 | 定时巡检 | `scheduler.py` → `get_distinct_funds()` | `fund_pool` | 全用户并集去重，同一指数每天只同步/计算一次；按用户提示词配置分组去重调用 AI，每用户各自入库与推送 |
 | 策略计算 | `strategy_engine.py` | `daily_market_data` | 读最新基本面、近 150 日价格、历史分位 |
 | 提示词配置 | `app.py` tab3 → `upsert_custom_prompt()` | `fund_custom_prompts` | 按用户生效，AI 调用时读取当前用户配置 |
@@ -222,6 +247,17 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 | `get_prompt_configs_for_users(fund_code, usernames)` | 批量读取多用户对同一指数的提示词配置，供定时巡检分组去重 |
 | `save_industry_list(df)` / `get_all_industries()` / `get_industry_count()` | 行业分类管理 |
 
+### 持仓状态（用户专属）
+
+| 函数 | 作用 |
+|------|------|
+| `normalize_position(pos, pnl)` | 纯函数：归一化持仓口径（未填报/仓位≤0 → `(0.0, 0.0)`；否则 round4）——Prompt/快照/签名三处共用 |
+| `upsert_user_position(username, code, pos, pnl)` | 校验（两项都填 + 值域含端点）后写入；返回 `(是否成功, 提示信息)` |
+| `get_user_position(username, code)` | 读取原始持仓（含 updated_at）；未填报返回 None（UI 回填用） |
+| `get_user_positions(username)` | 该用户全部持仓（key=fund_code，UI 总览用） |
+| `get_effective_position(username, code)` | 归一化持仓（流水线用），永不返回 None |
+| `get_effective_positions_for_users(code, usernames)` | 批量归一化（调度器签名用，单 SQL 无 N+1） |
+
 ---
 
 ## `init_db()` 行为说明
@@ -239,9 +275,24 @@ daily_market_data / idx_factor_data (fund_code + trade_date 联合主键)
 
 ## 注意事项
 
-### 1. 无 schema 迁移机制
+### 1. 无 schema 迁移机制（升级需手工迁移，历史数据必须保留）
 
-`init_db()` 只负责「建表」（`CREATE TABLE IF NOT EXISTS`），**不会**自动添加新字段或修改列类型。若调整表结构，需以空库重新部署（或手动 `ALTER TABLE`）。带入旧版库时，缺失列会直接报错暴露，属有意设计。
+`init_db()` 只负责「建表」（`CREATE TABLE IF NOT EXISTS`），**不会**自动添加新字段或修改列类型；代码中禁止写运行时 `ALTER` 迁移。调整表结构后，部署前需**手工迁移**（保留全部历史数据，务必先备份数据库文件）：
+
+```sql
+ALTER TABLE inspection_log ADD COLUMN position_ratio REAL;
+ALTER TABLE inspection_log ADD COLUMN unrealized_pnl_ratio REAL;
+CREATE TABLE IF NOT EXISTS user_position (
+    username TEXT NOT NULL,
+    fund_code TEXT NOT NULL,
+    position_ratio REAL NOT NULL,
+    unrealized_pnl_ratio REAL NOT NULL,
+    updated_at DATE DEFAULT (date('now', 'localtime')),
+    PRIMARY KEY (username, fund_code)
+);
+```
+
+验证（必做）：`PRAGMA table_info(inspection_log)` 应包含两个新列；`SELECT COUNT(*) FROM inspection_log` 与迁移前一致（历史记录零丢失）；启动应用跑一次巡检确认无报错。带入旧版库而未迁移时，缺失列会直接报错暴露，属有意设计；全新空库仅适用于无历史数据的场景。
 
 ### 2. 行情写入为 upsert
 
@@ -283,6 +334,13 @@ sqlite3 quant_system.db ".schema"
 
 ```sql
 SELECT * FROM fund_pool WHERE username = '你的用户名';
+```
+
+查看某用户的当前持仓状态：
+
+```sql
+SELECT fund_code, position_ratio, unrealized_pnl_ratio, updated_at
+FROM user_position WHERE username = '你的用户名';
 ```
 
 查看某标的最近 5 条行情：

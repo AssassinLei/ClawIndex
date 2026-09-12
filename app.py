@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import re
 from pathlib import Path
-from database import init_db, add_fund, remove_fund, get_all_funds, get_shared_category, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_idx_factor_for_date, get_latest_trade_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_user_setting, set_user_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt, register_user, user_exists
+from database import init_db, add_fund, remove_fund, get_all_funds, get_shared_category, get_all_industries, get_industry_count, get_inspection_history, get_indicator_history, get_market_data_for_date, get_latest_market_data, get_latest_idx_factor, get_idx_factor_for_date, get_latest_trade_date, get_webhook_urls, add_webhook_url, remove_webhook_url, get_setting, set_setting, get_user_setting, set_user_setting, get_custom_prompt, get_selected_indicators, upsert_custom_prompt, delete_custom_prompt, register_user, user_exists, get_user_positions, upsert_user_position
 from data_fetcher import sync_all_history, sync_incremental, fetch_industry_classify, fetch_index_members, is_trade_day, is_global_code
 from llm_agent import INDICATOR_META, INDICATOR_GROUPS, GLOBAL_INDICATOR_GROUPS, default_indicators_for, FACTOR_GROUPS, FACTOR_LABELS, FACTOR_CN, FACTOR_DESC, MAX_FACTOR_COUNT, _fmt_factor
 from webhook_sender import send_to_all_webhooks, is_action_pushable
@@ -361,6 +361,16 @@ def render_card_expander(card: dict, expanded: bool = False):
         if card.get('has_error'):
             st.error(f"⚠️ {card.get('error_msg', '未知错误')}")
         else:
+            # 本次决策实际使用的持仓（数据来自流水线 position_snapshot；缺失时跳过该行）
+            snap = card.get('position_snapshot')
+            if snap:
+                snap_pos = snap.get('position_ratio') or 0.0
+                snap_pnl = snap.get('unrealized_pnl_ratio') or 0.0
+                if snap_pos <= 0:
+                    st.caption("🧭 本次决策持仓：空仓（0%）")
+                else:
+                    st.caption(f"🧭 本次决策持仓：仓位 {snap_pos * 100:.1f}% · 浮盈浮亏 {snap_pnl * 100:+.1f}%")
+
             col_left, col_right = st.columns([1, 1.5])
 
             # ===== 左列：纯指标数据 =====
@@ -843,7 +853,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 st.markdown("策略不动摇，AI助决断。")
 
-tab1, tab2, tab3 = st.tabs(["研判", "历史分析", "提示词配置"])
+tab1, tab2, tab3, tab4 = st.tabs(["研判", "历史分析", "提示词配置", "持仓管理"])
 
 with tab1:
     # --- 巡检按钮（仅非活跃状态显示）---
@@ -946,6 +956,7 @@ with tab1:
                 'details': fund_data.get('decision', {}).get('details', []),
                 'ai_report': ai_result,
                 'confidence': confidence,
+                'position_snapshot': fund_data.get('position_snapshot'),
             }
             render_card_header(current_card)
             render_card_expander(current_card, expanded=True)
@@ -1122,6 +1133,15 @@ with tab2:
                             col_c4.metric("120日均线", ma120_str)
                     else:
                         st.caption("该记录为旧版数据，无计算指标（请重新巡检以生成）")
+
+                    # 巡检时点持仓快照（FR-012；旧记录无快照 → 按「空仓」看待）
+                    st.markdown("**🧭 巡检时点持仓**")
+                    snap_pos = record.get('position_ratio')
+                    snap_pnl = record.get('unrealized_pnl_ratio')
+                    if snap_pos is None or snap_pos <= 0:
+                        st.caption("空仓（0%）")
+                    else:
+                        st.caption(f"仓位 {snap_pos * 100:.1f}% · 浮盈浮亏 {(snap_pnl or 0.0) * 100:+.1f}%")
 
                     # 技术因子入口（国际指数无因子数据，不展示）：按巡检日期回溯当日因子，
                     # 无当日数据时回退最新可用，与行情数据的回退策略一致
@@ -1300,3 +1320,103 @@ with tab3:
             - 建议关注：该指数的估值锚点（PE/PB/ROE）、行业特性、需要特别注意的风险维度
             - 最多 8000 字符，保存后下次巡检自动生效
             """)
+
+with tab4:
+    st.subheader("🧭 持仓管理", anchor=False)
+    st.caption(
+        "为每个监控指数维护你的当前仓位与浮盈浮亏（仅本账号生效，随时可修改）。"
+        "系统会在巡检时把这两项数据**如实提供给 AI**（只提供数据、不设定思考方式）；"
+        "若希望 AI 按特定框架解读（例如「不以盈亏作为买卖依据」），请在「提示词配置」中自行编写。"
+        "未填报的指数按「空仓（仓位 0%）」处理，不影响巡检。"
+    )
+
+    if not funds:
+        st.info("监控池为空，请先在左侧「监控池管理」添加指数。")
+    else:
+        # 保存成功提示（跨 rerun 持久化）
+        pos_saved_msg = st.session_state.pop("position_saved_msg", None)
+        if pos_saved_msg:
+            st.success(f"💾 {pos_saved_msg}")
+
+        positions_map = get_user_positions(username)
+        pos_fund_options = {f"{f['fund_name']} ({f['fund_code']})": f for f in funds}
+        sel_pos_label = st.selectbox("选择要维护的指数", list(pos_fund_options.keys()),
+                                     key="position_fund_selector")
+
+        if sel_pos_label:
+            pfund = pos_fund_options[sel_pos_label]
+            pcode = pfund['fund_code']
+            pname = pfund['fund_name']
+            raw_pos = positions_map.get(pcode)
+
+            if raw_pos:
+                st.success(
+                    f"✅ **{pname}** 当前持仓：仓位 {raw_pos['position_ratio'] * 100:.1f}% · "
+                    f"浮盈浮亏 {raw_pos['unrealized_pnl_ratio'] * 100:+.1f}%（更新于 {raw_pos['updated_at']}）"
+                )
+            else:
+                st.info(f"⚪ **{pname}** 尚未填报持仓 —— 巡检将按「空仓（仓位 0%）」处理，填报后即时生效。")
+
+            # 输入区（只传 key 不传 value，初始值经 session_state 预置，与提示词页同一模式）
+            k_pos = f"pos_input_{username}_{pcode}"
+            k_pnl = f"pnl_input_{username}_{pcode}"
+            if k_pos not in st.session_state:
+                st.session_state[k_pos] = None if not raw_pos else raw_pos["position_ratio"] * 100
+            if k_pnl not in st.session_state:
+                st.session_state[k_pnl] = None if not raw_pos else raw_pos["unrealized_pnl_ratio"] * 100
+
+            col_pos, col_pnl = st.columns(2)
+            with col_pos:
+                pos_input = st.number_input(
+                    "当前仓位（%）",
+                    min_value=0.0, max_value=100.0, step=1.0, format="%.1f",
+                    key=k_pos,
+                    help="相对个人目标仓位的完成度：例：计划最终投入 1 万元、目前已投 6000 元 → 填 60",
+                )
+            with col_pnl:
+                pnl_input = st.number_input(
+                    "浮盈浮亏（%）",
+                    min_value=-100.0, max_value=1000.0, step=1.0, format="%.1f",
+                    key=k_pnl,
+                    help="浮盈填正数、浮亏填负数；仅作为数据随巡检提供给 AI，不改变你的提示词逻辑",
+                )
+
+            if (pos_input is None or pos_input == 0) and pnl_input not in (None, 0):
+                st.warning("当前仓位为 0%（无持仓）→ 浮盈浮亏不参与分析：保存后将按「空仓」口径提供给 AI。")
+
+            if st.button("💾 保存持仓状态", key=f"save_position_{username}_{pcode}",
+                         type="primary", use_container_width=True):
+                if pos_input is None or pnl_input is None:
+                    st.error("请同时填写「当前仓位」与「浮盈浮亏」（都填或都不填）。")
+                else:
+                    ok, msg = upsert_user_position(username, pcode, pos_input / 100.0, pnl_input / 100.0)
+                    if ok:
+                        st.session_state.position_saved_msg = (
+                            f"已保存 {pname} 持仓（仓位 {pos_input:.1f}% · 浮盈浮亏 {pnl_input:+.1f}%）"
+                        )
+                        st.rerun()
+                    else:
+                        st.error(f"保存失败：{msg}")
+
+        st.divider()
+        st.markdown("**📊 全监控池持仓总览**")
+        overview_rows = []
+        for f in funds:
+            p = positions_map.get(f['fund_code'])
+            if p:
+                overview_rows.append({
+                    "代码": f['fund_code'],
+                    "名称": f['fund_name'],
+                    "仓位": f"{p['position_ratio'] * 100:.1f}%",
+                    "浮盈浮亏": f"{p['unrealized_pnl_ratio'] * 100:+.1f}%",
+                    "更新时间": p['updated_at'],
+                })
+            else:
+                overview_rows.append({
+                    "代码": f['fund_code'],
+                    "名称": f['fund_name'],
+                    "仓位": "未填报（巡检按空仓）",
+                    "浮盈浮亏": "—",
+                    "更新时间": "—",
+                })
+        st.dataframe(pd.DataFrame(overview_rows), hide_index=True, use_container_width=True)

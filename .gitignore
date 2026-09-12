@@ -1,5 +1,8 @@
-# 数据库文件 (本地生成)
-quant_system.db
+# 数据库文件 (本地生成；含生产库副本与备份)
+quant_system*.db
+quant_system*.db.bak
+quant_system*.db-wal
+quant_system*.db-shm
 
 # Python
 __pycache__/
@@ -19,4 +22,8 @@ venv/
 
 # 日志
 logs/
+
+# AI 工具 / spec-kit
 .qoder/
+.specify/
+specs/

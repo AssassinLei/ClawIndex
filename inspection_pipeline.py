@@ -6,7 +6,7 @@ ClawIndex 巡检流水线模块
 
 两段式拆分：
 - prepare_fund_data：同步 + 指标计算，每指数只需执行一次（用户无关）。
-- analyze_and_save_for_user：AI 分析 + 入库，按用户执行（读取该用户的提示词配置）。
+- analyze_and_save_for_user：AI 分析 + 入库，按用户执行（读取该用户提示词配置与持仓；持仓以数据行注入 User Prompt，并随记录保存快照）。
 - run_single_inspection：组合以上两段，供手动巡检（单用户）便捷调用。
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import copy
 from data_fetcher import sync_incremental
 from strategy_engine import generate_fund_report
 from llm_agent import generate_ai_report_with_config
-from database import save_inspection_result
+from database import save_inspection_result, get_effective_position
 from logger import setup_logger
 
 logger = setup_logger("inspection_pipeline")
@@ -49,20 +49,26 @@ def prepare_fund_data(fund_code: str, fund_name: str, category: str) -> dict:
     return fund_data
 
 
-def analyze_and_save_for_user(fund_data: dict, username: str, ai_result: dict | None = None) -> dict:
+def analyze_and_save_for_user(fund_data: dict, username: str, ai_result: dict | None = None,
+                              user_position: tuple[float, float] | None = None) -> dict:
     """
     第二段：AI 分析 + 入库（按用户）。
 
     参数 ai_result: 已算好的 AI 结果（供定时巡检按配置去重后复用）；
                     为 None 时按该用户的提示词配置调用一次 AI。
+    参数 user_position: 归一化持仓元组 (pos, pnl)。为 None 时读取一次
+                    get_effective_position（未填报/空仓 → (0.0, 0.0)）；同一值既用于
+                    Prompt 数据行注入又用于快照入库，保证「快照 ≡ 实际 Prompt 上下文」。
+                    定时巡检复用路径传入其分组同源值，不再查库。
 
     对 fund_data 做浅拷贝再写入 decision，避免多用户共享同一 dict 互相覆盖。
     has_error 时 decision.action 与入库 action 统一为"数据异常"。
-    ai_result 含 ai_error 标记（AI 调用失败）时不入库，避免垃圾结果覆盖当日有效记录。
+    ai_result 含 ai_error 标记（AI 调用失败）时不入库（快照随之不产生），
+    避免垃圾结果覆盖当日有效记录。
 
     Returns:
         {
-            "fund_data": dict,   # 含该用户 decision 的用户版 fund_data
+            "fund_data": dict,   # 含该用户 decision 与 position_snapshot 的用户版 fund_data
             "ai_report": dict,   # {analysis, advice, confidence[, ai_error]}
             "has_error": bool,   # 策略引擎/同步是否返回 error
             "ai_error": bool,    # AI 调用是否失败（失败时未入库）
@@ -70,9 +76,14 @@ def analyze_and_save_for_user(fund_data: dict, username: str, ai_result: dict | 
     """
     has_error = "error" in fund_data
 
+    # 持仓（归一化唯一口径）：手动路径读一次即锁定，Prompt 与快照同源（不变量 I1）
+    if user_position is None:
+        user_position = get_effective_position(username, fund_data.get("fund_code", ""))
+    pos, pnl = user_position
+
     # 3. AI 分析（返回 dict: {analysis, advice, confidence}）
     if ai_result is None:
-        ai_result = generate_ai_report_with_config(fund_data, username)
+        ai_result = generate_ai_report_with_config(fund_data, username, user_position=user_position)
     advice = ai_result.get("advice", "持有/观望")
     analysis = ai_result.get("analysis", "")
     confidence = ai_result.get("confidence", 0)
@@ -86,6 +97,11 @@ def analyze_and_save_for_user(fund_data: dict, username: str, ai_result: dict | 
     user_fund_data["decision"] = {
         "action": final_action,
         "details": [analysis],
+    }
+    # 本次决策实际使用的持仓（供 UI 卡片展示；webhook 忽略未知键）
+    user_fund_data["position_snapshot"] = {
+        "position_ratio": pos,
+        "unrealized_pnl_ratio": pnl,
     }
 
     # 4. 入库（按用户）；AI 调用失败时跳过，避免 INSERT OR REPLACE 覆盖当日已有有效记录
@@ -107,6 +123,8 @@ def analyze_and_save_for_user(fund_data: dict, username: str, ai_result: dict | 
             amount=inds.get("amount"),
             amount_ma20=inds.get("amount_ma20"),
             confidence=confidence,
+            position_ratio=pos,
+            unrealized_pnl_ratio=pnl,
         )
 
     return {

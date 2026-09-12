@@ -17,7 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 from database import (
     get_distinct_funds, get_fund_watchers_map, get_all_users,
     get_webhook_urls, get_setting, set_setting, get_user_setting,
-    get_prompt_configs_for_users,
+    get_prompt_configs_for_users, get_effective_positions_for_users,
 )
 from data_fetcher import is_trade_day, is_global_code
 from inspection_pipeline import prepare_fund_data, analyze_and_save_for_user
@@ -104,10 +104,13 @@ def run_scheduled_inspection():
                     sync_error_count += 1
                     continue
 
-                # 2. 取监控该指数的用户，按提示词配置分组去重（相同配置只调一次 LLM）
+                # 2. 取监控该指数的用户，按决策上下文分组去重（相同配置只调一次 LLM）
                 watchers = watchers_map.get(code, [])
                 configs = get_prompt_configs_for_users(code, watchers)
-                # 签名 (custom_prompt, tuple(sorted(归一化后指标))) → AI 结果缓存；
+                # 持仓批量读取（单 SQL，循环内零额外查询）；签名并入归一化持仓（FR-014）：
+                # 持仓/盈亏任一不同 → User Prompt 数据行不同 → 不得复用分析结果
+                positions = get_effective_positions_for_users(code, watchers)
+                # 签名 (custom_prompt, tuple(sorted(归一化指标)), pos, pnl) → AI 结果缓存；
                 # 未配置与显式勾选默认指标的用户归一化后合并为同一组，避免等效配置重复调用
                 group_cache: dict[tuple, dict] = {}
                 llm_calls = 0
@@ -119,13 +122,15 @@ def run_scheduled_inspection():
                     # 归一化：空配置与显式勾选默认指标的 Prompt 完全一致，统一按分类默认指标处理；
                     # 技术因子排序截断与 generate_ai_report 内部口径一致，保证签名相同 ⟺ 最终 prompt 相同
                     effective_inds = normalize_selected_indicators(selected_indicators, cat)
-                    signature = (custom_prompt, tuple(effective_inds))
+                    pos, pnl = positions.get(user, (0.0, 0.0))
+                    signature = (custom_prompt, tuple(effective_inds), pos, pnl)
                     ai_result = group_cache.get(signature)
                     if ai_result is None:
                         ai_result = generate_ai_report(
                             fund_data,
                             custom_prompt=custom_prompt,
                             selected_indicators=effective_inds,
+                            user_position=(pos, pnl),
                         )
                         # 失败结果（含 ai_error）也写入缓存：同组后续用户不再重复触发注定失败的调用
                         group_cache[signature] = ai_result
@@ -134,7 +139,8 @@ def run_scheduled_inspection():
                         time.sleep(LLM_CALL_INTERVAL)
 
                     # 3. 每个用户各自入库（复用同组 AI 结果；AI 失败时 pipeline 层已跳过入库）
-                    user_result = analyze_and_save_for_user(fund_data, user, ai_result=ai_result)
+                    user_result = analyze_and_save_for_user(fund_data, user, ai_result=ai_result,
+                                                            user_position=(pos, pnl))
 
                     # AI 调用失败：不推送垃圾结果，计数后处理下一用户
                     if user_result.get("ai_error"):

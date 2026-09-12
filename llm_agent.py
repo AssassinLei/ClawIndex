@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Dict
 from logger import setup_logger
-from database import get_custom_prompt, get_selected_indicators
+from database import get_custom_prompt, get_selected_indicators, get_effective_position
 
 logger = setup_logger("llm_agent")
 
@@ -271,6 +271,23 @@ def _build_indicators_text(inds: dict, selected: list[str] | None, groups: list 
     return "\n    ".join(lines)
 
 
+def _build_position_line(pos, pnl) -> str:
+    """渲染 User Prompt 的持仓数据行（空仓 / 有仓两种格式）。
+
+    仅陈述数据事实（数值与含义注解），**不含任何规则、建议或问法**——
+    「如何思考持仓/盈亏」属用户提示词职责（系统保持中立）。
+    数值口径由 database.normalize_position 统一负责，此处只做展示格式化。
+    """
+    pos = float(pos) + 0.0  # + 0.0 归一 round 可能产生的 -0.0
+    if pos <= 0:
+        return "- **用户当前持仓**：空仓（仓位 0%）"
+    pnl = float(pnl) + 0.0
+    return (
+        f"- **用户当前持仓**：仓位 {pos * 100:.1f}%（相对个人目标仓位的完成度），"
+        f"浮盈浮亏 {pnl * 100:+.1f}%"
+    )
+
+
 # 合法的 AI 操作建议值
 VALID_ADVICE = frozenset({"买入", "卖出", "持有/观望"})
 
@@ -357,7 +374,11 @@ def _parse_ai_json(raw: str) -> dict:
 
 
 def _build_system_prompt(category: str, custom_prompt: str | None) -> str:
-    """构建 System Prompt：prompt.md 基础 + 策略描述 + JSON Schema 约束"""
+    """构建 System Prompt：prompt.md 基础 + 策略描述 + JSON Schema 约束
+
+    注意：**不追加任何持仓/盈亏内容**（系统只提供数据、不设定思考方式）；
+    持仓数据行仅出现在 User Prompt，见 _build_position_line。
+    """
 
     json_schema = (
         "# 输出格式（严格遵守）\n"
@@ -369,7 +390,7 @@ def _build_system_prompt(category: str, custom_prompt: str | None) -> str:
         '- analysis: 基于第一性原理的推导分析，简洁易理解\n'
         '- advice: 唯一操作建议，必须是 "买入"、"卖出" 或 "持有/观望" 之一\n'
         '- confidence: 当前数据与策略的匹配程度（0~100），不是未来上涨概率\n\n'
-        "直接输出 JSON，不要加 ```json 标记！"
+        "MUST直接输出 JSON"
     )
 
     if custom_prompt and custom_prompt.strip():
@@ -384,12 +405,15 @@ def _build_system_prompt(category: str, custom_prompt: str | None) -> str:
     return prompt
 
 
-def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indicators: list[str] | None = None) -> dict:
+def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indicators: list[str] | None = None,
+                       user_position: tuple[float, float] | None = None) -> dict:
     """
     根据指标数据，由 AI 自主分析并输出结构化决策。
 
     参数 custom_prompt: 用户为指数定制的分析框架，注入 System Prompt 作为补充策略。
     参数 selected_indicators: 用户勾选的指标列表，None 表示全部。
+    参数 user_position: 归一化持仓元组 (pos, pnl)；None 视同空仓 (0.0, 0.0)。
+        仅在 User Prompt 中追加一行持仓数据（系统只提供数据，不注入思考规则）。
 
     返回: {"analysis": str, "advice": str, "confidence": int}；
     AI 调用失败（API 异常/空响应）时额外含 "ai_error": True，下游据此跳过入库与推送。
@@ -419,12 +443,17 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
     if selected_indicators:
         logger.info(f"generate_ai_report: {code} 已筛选指标 {selected_indicators}")
 
+    eff_pos, eff_pnl = user_position or (0.0, 0.0)
+    position_line = _build_position_line(eff_pos, eff_pnl)
+
+    # 输出契约在 User 末尾重申一次（近因效应：离生成点最近，提升 JSON 合规率与「仅依据数据、不臆造」）
     user_prompt = f"""请根据以下指数数据进行分析：
 
 - **监控指数**：{name}（{code}）(分类标签: {cat})
+{position_line}
 {indicators_text}
 
-请输出你的 JSON 分析结果。"""
+请仅依据以上数据推导，并直接输出 JSON（analysis / advice / confidence）。"""
 
     try:
         logger.info(f"generate_ai_report: {code} (category={cat}), 调用 {MODEL_NAME}")
@@ -496,16 +525,23 @@ def generate_ai_report(fund_data: Dict, custom_prompt: str = None, selected_indi
         return {"analysis": f"AI 报告生成失败 [{type(e).__name__}]: {str(e)}", "advice": "持有/观望", "confidence": 0, "ai_error": True}
 
 
-def generate_ai_report_with_config(fund_data: Dict, username: str) -> dict:
+def generate_ai_report_with_config(fund_data: Dict, username: str,
+                                   user_position: tuple[float, float] | None = None) -> dict:
     """
     高层封装：自动从数据库读取该用户对该指数的定制提示词与指标勾选配置，
     再调用 generate_ai_report。调用方无需关心数据库查询细节。
+
+    参数 user_position: 归一化持仓元组；为 None 时内部读取 get_effective_position
+    （未填报/空仓 → (0.0, 0.0)）。流水线传入时以此为准，保证 Prompt 值与快照值同源。
     """
     code = fund_data.get('fund_code', '')
     custom_prompt = get_custom_prompt(username, code)
     selected_indicators = get_selected_indicators(username, code) or None
+    if user_position is None:
+        user_position = get_effective_position(username, code)
     return generate_ai_report(
         fund_data,
         custom_prompt=custom_prompt,
         selected_indicators=selected_indicators,
+        user_position=user_position,
     )
