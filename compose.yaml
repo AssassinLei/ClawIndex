@@ -1,7 +1,11 @@
 name: clawindex
 x-app: &app
   image: ${CLAWINDEX_IMAGE:-clawindex:local}
-  build: .
+  build:
+    context: .
+    args:
+      APT_MIRROR: ${CLAWINDEX_APT_MIRROR:-}
+      PIP_INDEX_URL: ${CLAWINDEX_PIP_INDEX_URL:-https://pypi.org/simple}
   env_file: .env.cloud
   environment:
     VNEXT_DB_PATH: /data/quant_system_next.db

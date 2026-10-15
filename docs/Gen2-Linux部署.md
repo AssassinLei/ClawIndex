@@ -41,6 +41,21 @@ CLAWINDEX_PORT=8502
 
 AI密钥可以留空；行情Token需填写。其余变量保持模板默认值。不要将真实配置提交到Git。
 
+### 中国大陆服务器的软件包下载
+
+Docker镜像加速器只加速`FROM python:...`，不会加速镜像内部的Debian软件包或Python依赖。如果构建卡在`apt-get update`的`Packages`下载，可在现有`.env.cloud`末尾添加：
+
+```dotenv
+CLAWINDEX_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+CLAWINDEX_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+依据[清华Debian镜像说明](https://mirrors.tuna.tsinghua.edu.cn/help/debian/)和[PyPI镜像说明](https://mirrors.tuna.tsinghua.edu.cn/help/pypi/)。APT设置使用镜像的`/debian`和`/debian-security`，保留Bookworm版本与原签名验证；使用镜像的安全更新可能受同步延迟影响。留空`CLAWINDEX_APT_MIRROR`可恢复基础镜像默认源，PyPI默认值为`https://pypi.org/simple`。
+
+首次安装因下载失败时，按Ctrl+C停止旧构建，先`git pull --ff-only origin Gen2`取得支持这些变量的代码，再运行`sudo env BUILDKIT_PROGRESS=plain bash deploy.sh install --empty`。构建失败发生在初始化之前，无需删除数据卷；已有库的部署仍使用`update`。配置保存在被Git忽略的`.env.cloud`，不用修改或提交Dockerfile。APT设有30秒网络等待超时和2次重试，pip也设置超时重试；失败会退出并保留错误，持续有少量传输时总时间仍可能更长。
+
+SQLite源码仍从官方网站下载并校验固定发布摘要，以上配置不更改源码地址。如果后续停在SQLite下载，应依据那一步的实际报错排查，不关闭校验。
+
 ## 3. 首次部署：推荐保留本地新版数据
 
 先停止本地旧worker，避免本地和云端同时按两份数据库推送提醒。把**新版schema 2库的一致性备份**单独上传到服务器，例如`/root/next-export.db`。当前工作区已准备的导出文件在本地`backups/`目录，不在Git中。

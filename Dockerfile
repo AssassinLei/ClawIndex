@@ -1,13 +1,19 @@
 FROM python:3.12-slim-bookworm AS sqlite-builder
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG APT_MIRROR=""
+COPY scripts/configure_build_sources.py /tmp/configure_build_sources.py
+RUN python /tmp/configure_build_sources.py "$APT_MIRROR" && \
+    apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update && \
+    apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 install -y --no-install-recommends gcc libc6-dev ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 COPY scripts/fetch_sqlite_source.py /tmp/fetch_sqlite_source.py
 RUN python /tmp/fetch_sqlite_source.py /tmp/sqlite && mkdir /opt/sqlite && \
     gcc -O2 -fPIC -shared -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE \
     -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_MATH_FUNCTIONS /tmp/sqlite/sqlite3.c \
     -o /opt/sqlite/libsqlite3.so.0 -lm -ldl -pthread
 COPY requirements-next-tested.txt /tmp/requirements-next-tested.txt
+ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN python -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements-next-tested.txt
+    /opt/venv/bin/pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --timeout 30 --retries 3 -r /tmp/requirements-next-tested.txt
 
 FROM python:3.12-slim-bookworm
 LABEL org.opencontainers.image.source="https://github.com/AssassinLei/ClawIndex" \
