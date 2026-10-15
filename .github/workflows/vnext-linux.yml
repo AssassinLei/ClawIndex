@@ -41,6 +41,7 @@ jobs:
       - name: Collect diagnostic logs
         if: always()
         run: |
+          mkdir -p reports/linux
           docker compose ps -a > reports/linux/compose-status.txt
           docker compose logs --no-color > reports/linux/compose.log
           docker compose down

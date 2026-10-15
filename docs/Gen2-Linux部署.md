@@ -54,6 +54,8 @@ scp .\backups\next-export.db 你的服务器用户@服务器IP:/绝对路径/nex
 
 这里要上传`quant_system_next.db`的导出，**不是**老版`quant_system.db`或`quant_system20261012.db`。不要直接复制运行中的单个`.db`而漏掉WAL。导出会保存账号、关注、持仓、策略、历史与现有渠道设置，不自动扩大提醒授权。
 
+本次已另备压缩导出`backups/Gen2-cloud-export-20261015.db.gz`，约145 MiB，可缩短上传时间。上传这个文件后，先在服务器执行`gzip -dk /绝对路径/Gen2-cloud-export-20261015.db.gz`，再导入解压得到的`.db`文件。导入命令不直接接受`.gz`。
+
 在服务器的Gen2项目目录执行：
 
 ```bash
