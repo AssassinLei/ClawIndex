@@ -70,12 +70,21 @@ def host_cli(tmp_path):
     fake=tmp_path/'fake-host.sh'
     fake.write_text('''
 flock() { return 0; }
+id() {
+  if [[ "$1" == -u && -n "${FAKE_UID:-}" ]]; then printf '%s\\n' "$FAKE_UID"; else command id "$@"; fi
+}
+sudo() {
+  printf 'sudo %s\\n' "$*" >> "$EVENTS"
+  [[ "$1" == -H && "$2" == -u && "$4" == -- && "$5" == git ]] || return 90
+  shift 4
+  "$@"
+}
 git() {
   printf 'git %s\\n' "$*" >> "$EVENTS"
   case "$1" in
     branch) printf 'Gen2\\n';;
     rev-parse) printf '012345abcdef\\n';;
-    status) printf '%s' "${DIRTY:-}";;
+    status) [[ "${GIT_STATUS_FAIL:-0}" == 0 ]] || return 128; printf '%s' "${DIRTY:-}";;
   esac
 }
 docker() {
@@ -147,3 +156,31 @@ def test_new_admin_command_does_not_start_workers_or_notifications(host_cli):
     assert result.returncode==0,result.stderr
     assert 'ops create-user --admin -- 测试账号' in events
     assert 'up -d' not in events
+
+
+@pytest.mark.parametrize('action,extra', [('install', ['--empty']), ('update', [])])
+def test_sudo_deploy_runs_every_git_operation_as_original_login_user(host_cli, action, extra):
+    run,_=host_cli
+    result,events=run(action,*extra,FAKE_UID='0',SUDO_UID='1234',DB_STATUS='10' if action=='install' else '0')
+    assert result.returncode==0,result.stderr
+    git_commands=[line.removeprefix('git ') for line in events.splitlines() if line.startswith('git ')]
+    assert git_commands
+    for command in git_commands:
+        assert 'sudo -H -u #1234 -- git '+command in events
+    assert 'sudo -H -u #1234 -- docker' not in events
+
+
+def test_normal_login_does_not_switch_git_user(host_cli):
+    run,_=host_cli
+    result,events=run('update',FAKE_UID='1234',SUDO_UID='9999')
+    assert result.returncode==0,result.stderr
+    assert 'sudo ' not in events and 'git fetch origin Gen2' in events
+
+
+@pytest.mark.parametrize('action,extra', [('install', ['--empty']), ('update', [])])
+def test_git_index_read_failure_blocks_deploy_before_build_backup_or_fetch(host_cli, action, extra):
+    run,_=host_cli
+    result,events=run(action,*extra,GIT_STATUS_FAIL='1')
+    assert result.returncode!=0
+    assert 'build worker' not in events and 'ops backup' not in events
+    assert 'git fetch' not in events and 'up -d' not in events

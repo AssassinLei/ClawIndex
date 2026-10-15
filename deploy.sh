@@ -55,6 +55,21 @@ chmod 600 .env.cloud
 compose() { docker compose --env-file "$ROOT/.env.cloud" -f "$ROOT/compose.yaml" "$@"; }
 ops() { compose run --rm --no-deps ops "$@"; }
 check_config() { compose run --rm --no-deps --entrypoint python ops -m clawindex_next.deployment config; }
+repo_git() {
+  # Docker needs root on many hosts; Git must retain the login user's files and credentials.
+  if [[ "$(id -u)" == 0 && ${SUDO_UID:-0} =~ ^[0-9]+$ && ${SUDO_UID:-0} != 0 ]]; then
+    sudo -H -u "#${SUDO_UID}" -- git "$@"
+  else
+    git "$@"
+  fi
+}
+check_repo() {
+  local branch changes
+  branch="$(repo_git branch --show-current)" || fail '无法读取Git分支，请检查项目目录权限'
+  [[ "$branch" == Gen2 ]] || fail '请先切换到Gen2分支再部署或更新'
+  changes="$(repo_git status --porcelain --untracked-files=normal)" || fail '无法读取Git状态，请检查项目目录及.git的所有权；不会继续部署'
+  [[ -z "$changes" ]] || fail '项目有本地代码改动，请先妥善保存；不会强制覆盖，.env.cloud和数据库不受影响'
+}
 db_state() {
   local rc=0
   compose run --rm --no-deps --entrypoint python ops -m clawindex_next.deployment status || rc=$?
@@ -89,9 +104,8 @@ case "$ACTION" in
       IMPORT="$(realpath -- "$IMPORT")"
       [[ "$IMPORT" != *:* && "$IMPORT" != *,* ]] || fail '导入路径不能含冒号或逗号'
     fi
-    [[ "$(git branch --show-current)" == Gen2 ]] || fail '请先切换到Gen2分支再部署'
-    [[ -z "$(git status --porcelain --untracked-files=normal)" ]] || fail '请先保存本地代码改动再部署；.env.cloud和数据库不受影响'
-    revision="$(git rev-parse --short=12 HEAD)"
+    check_repo
+    revision="$(repo_git rev-parse --short=12 HEAD)"
     export CLAWINDEX_IMAGE="clawindex:gen2-$revision"
     compose config --quiet
     compose build worker
@@ -115,14 +129,13 @@ case "$ACTION" in
     start
     ;;
   update)
-    [[ "$(git branch --show-current)" == Gen2 ]] || fail '仅在Gen2分支上执行更新'
-    [[ -z "$(git status --porcelain --untracked-files=normal)" ]] || fail '项目有本地代码改动，请先妥善保存；不会强制覆盖'
+    check_repo
     running_image
     db_state
     backup
-    git fetch origin Gen2
-    git merge --ff-only origin/Gen2
-    revision="$(git rev-parse --short=12 HEAD)"
+    repo_git fetch origin Gen2
+    repo_git merge --ff-only origin/Gen2
+    revision="$(repo_git rev-parse --short=12 HEAD)"
     export CLAWINDEX_IMAGE="clawindex:gen2-$revision"
     compose config --quiet
     compose build worker

@@ -16,7 +16,7 @@ docker --version
 sudo docker compose version
 ```
 
-下面的部署命令需要Docker权限。如果当前用户不能访问Docker，使用`sudo bash deploy.sh ...`；Git私有仓库凭据也应由执行更新的这个用户配置。脚本使用`flock`防止并发部署，通常由系统的`util-linux`提供。
+下面的部署命令需要Docker权限。如果当前用户不能访问Docker，使用`sudo bash deploy.sh ...`。通过sudo调用时，新版脚本会将所有Git操作交给原登录用户，保留该用户的仓库所有权与Git凭据；Docker操作保持原来的权限。脚本使用`flock`防止并发部署，通常由系统的`util-linux`提供。
 
 ## 2. 取得Gen2代码并填写一次配置
 
@@ -146,6 +146,7 @@ sudo docker compose --env-file .env.cloud cp worker:/backups/替换为备份文�
 - 镜像/依赖下载失败：检查服务器访问Docker Hub、PyPI及SQLite官网的网络；原服务在构建阶段不会被停止。
 - 8502端口冲突：停止旧部署或在`.env.cloud`修改主机端口，不要关闭无关进程。
 - 初始化拒绝：服务器已经有库；日常使用`start`或`update`。
+- `fatal: .git/index: ... Permission denied`：旧脚本通过sudo运行Git可能留下root所有的索引。以实际项目所有者登录，执行`sudo chown -R "$(id -u):$(id -g)" "$HOME/ClawIndex-Gen2"`恢复这个项目目录的所有权，再以普通用户执行`git pull --ff-only origin Gen2`取得权限修复。项目在其他路径时换成准确的项目路径；不要修改整个HOME或删除`.git`。新脚本不自动递归修改仓库权限。
 - 健康检查超时：运行`logs`看具体原因。不要为了让它启动而删除数据卷。
 
 GitHub中的Linux CI会构建镜像、运行回归和离线Compose恢复/备份测试，可在[Actions](https://github.com/AssassinLei/ClawIndex/actions)查看Gen2对应提交。CI使用一次性合成数据库，不使用你的行情密钥或真实Webhook。真实服务器的网络、权限和运行状态，仍以服务器部署结果为准。
