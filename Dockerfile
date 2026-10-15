@@ -6,6 +6,7 @@ RUN python /tmp/configure_build_sources.py "$APT_MIRROR" && \
     apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 install -y --no-install-recommends gcc libc6-dev ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 COPY scripts/fetch_sqlite_source.py /tmp/fetch_sqlite_source.py
+COPY scripts/vendor/sqlite-amalgamation-3510300.zip /tmp/vendor/sqlite-amalgamation-3510300.zip
 RUN python /tmp/fetch_sqlite_source.py /tmp/sqlite && mkdir /opt/sqlite && \
     gcc -O2 -fPIC -shared -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE \
     -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_MATH_FUNCTIONS /tmp/sqlite/sqlite3.c \

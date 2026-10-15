@@ -54,7 +54,7 @@ CLAWINDEX_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 首次安装因下载失败时，按Ctrl+C停止旧构建，先`git pull --ff-only origin Gen2`取得支持这些变量的代码，再运行`sudo env BUILDKIT_PROGRESS=plain bash deploy.sh install --empty`。构建失败发生在初始化之前，无需删除数据卷；已有库的部署仍使用`update`。配置保存在被Git忽略的`.env.cloud`，不用修改或提交Dockerfile。APT设有30秒网络等待超时和2次重试，pip也设置超时重试；失败会退出并保留错误，持续有少量传输时总时间仍可能更长。
 
-SQLite源码仍从官方网站下载并校验固定发布摘要，以上配置不更改源码地址。如果后续停在SQLite下载，应依据那一步的实际报错排查，不关闭校验。
+SQLite 3.51.3官方源码包已随Git仓库提供（约2.7 MiB），构建时离线校验、解压并编译，不再访问SQLite官网。会同时校验压缩包、`sqlite3.c`与`sqlite3.h`，并在运行镜像确认实际链接版本。若旧版本报SQLite源码下载超时，取得最新Gen2代码后重新执行安装即可；不用增加代理地址或关闭校验。gcc编译期间可能数分钟没有新输出，与之前的网络下载超时不同。
 
 ## 3. 首次部署：推荐保留本地新版数据
 
