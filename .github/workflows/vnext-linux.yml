@@ -1,0 +1,51 @@
+name: VNext Linux acceptance
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build verified SQLite runtime
+        run: |
+          cp .env.cloud.example .env.cloud
+          docker compose build
+          docker compose config --quiet
+      - name: Run regression suite in Linux image
+        run: |
+          mkdir -p reports/linux
+          chmod 777 reports/linux
+          docker run --rm --entrypoint python \
+            -v "$PWD/tests_next:/app/tests_next:ro" \
+            -v "$PWD/pytest.ini:/app/pytest.ini:ro" \
+            -v "$PWD/deploy.sh:/app/deploy.sh:ro" \
+            -v "$PWD/reports/linux:/reports" \
+            clawindex:local -m pytest tests_next -q --junitxml=/reports/tests.xml
+      - name: Offline Compose jobs, restart, stop and backup
+        run: |
+          docker compose run --rm --entrypoint python ops scripts/cloud_smoke.py prepare
+          docker compose up -d --wait
+          docker compose run --rm --entrypoint python ops scripts/cloud_smoke.py check
+          docker compose run --rm --entrypoint python ops scripts/cloud_smoke.py submit
+          docker compose exec -T worker sh -c 'kill -9 1' || true
+          sleep 10
+          docker compose run --rm --entrypoint python ops scripts/cloud_smoke.py check
+          docker compose run --rm ops backup --output /backups/acceptance.db
+          docker compose stop worker
+          docker compose run --rm --entrypoint python ops scripts/cloud_smoke.py stopped
+      - name: Collect diagnostic logs
+        if: always()
+        run: |
+          docker compose ps -a > reports/linux/compose-status.txt
+          docker compose logs --no-color > reports/linux/compose.log
+          docker compose down
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-acceptance
+          path: reports/linux

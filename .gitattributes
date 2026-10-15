@@ -10,6 +10,8 @@
 *.yaml text
 *.yml text
 *.toml text
+*.sh text eol=lf
+Dockerfile text eol=lf
 *.cfg text
 *.ini text
 

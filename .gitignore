@@ -3,6 +3,12 @@ quant_system*.db
 quant_system*.db.bak
 quant_system*.db-wal
 quant_system*.db-shm
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.bak
 
 # Python
 __pycache__/
@@ -11,6 +17,16 @@ __pycache__/
 
 # 环境变量 / 密钥
 .env
+.env.next
+.env.cloud
+.env.*
+!.env.*.example
+data/
+backups/
+*.migrating
+.pytest_cache/
+.deploy.lock
+reports/
 
 # IDE
 .vscode/

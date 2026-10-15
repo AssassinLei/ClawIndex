@@ -1,0 +1,51 @@
+name: clawindex
+x-app: &app
+  image: ${CLAWINDEX_IMAGE:-clawindex:local}
+  build: .
+  env_file: .env.cloud
+  environment:
+    VNEXT_DB_PATH: /data/quant_system_next.db
+    VNEXT_CLOUD: "true"
+  volumes:
+    - clawindex-data:/data
+    - clawindex-backups:/backups
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 120s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+services:
+  worker:
+    <<: *app
+    command: [worker]
+    healthcheck:
+      test: [CMD, python, -m, clawindex_next.cloud, worker]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+  web:
+    <<: *app
+    command: [web]
+    ports:
+      - "${CLAWINDEX_BIND_ADDRESS:-127.0.0.1}:${CLAWINDEX_PORT:-8502}:8502"
+    depends_on:
+      worker:
+        condition: service_started
+    healthcheck:
+      test: [CMD, python, -m, clawindex_next.cloud, web]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+  ops:
+    <<: *app
+    profiles: [tools]
+    restart: "no"
+    command: [doctor]
+volumes:
+  clawindex-data:
+  clawindex-backups:

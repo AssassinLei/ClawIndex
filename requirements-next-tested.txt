@@ -1,0 +1,10 @@
+streamlit==1.65.0
+pandas==2.3.3
+numpy==1.26.4
+tushare==1.4.29
+openai==2.54.0
+python-dotenv==1.2.4
+requests==2.34.2
+exchange-calendars==4.13.2
+pytest==8.4.2
+psutil==5.9.0
