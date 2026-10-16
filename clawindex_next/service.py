@@ -375,8 +375,10 @@ class UserService:
             rows = [dict(r) for r in c.execute("SELECT id,label,enabled FROM channels WHERE user_id=? AND url<>'' ORDER BY id",(uid,))]
             return [{**r,'mode':channel_mode(c,r['id'],uid,r['enabled'])} for r in rows]
 
-    def set_channel(self, url, label, enabled=False, mode=None, radar_mode='OFF'):
+    def set_channel(self, url, label, enabled=False, mode=None, radar_mode='OFF', schedule=None):
         url = validate_url(url)
+        from .webhook_schedule import normalize, config_key as schedule_key
+        schedule = normalize(schedule)
         from .radar_notifications import MODES as RADAR_MODES, config_key
         if radar_mode not in RADAR_MODES:
             raise ValueError('机会提醒方式无效')
@@ -389,7 +391,27 @@ class UserService:
             if mode!='OFF':
                 c.execute('INSERT INTO settings VALUES(?,?)',(filter_key(uid,cid),mode))
             c.execute('INSERT INTO settings VALUES(?,?)',(config_key(uid,cid),canonical(radar_mode)))
+            c.execute('INSERT INTO settings VALUES(?,?)',(schedule_key(uid,cid),canonical(schedule)))
             return cid
+
+    def channel_schedule(self, channel_id):
+        from .webhook_schedule import read, next_times
+        uid = self.user['id']
+        with self.store.connect() as c:
+            if not c.execute("SELECT id FROM channels WHERE id=? AND user_id=? AND url<>''",(channel_id,uid)).fetchone():
+                raise PermissionError('不能查看其他账号的Webhook发送时间')
+            config = read(c,uid,channel_id)
+        return {**config,'next_times':next_times(config)}
+
+    def configure_channel_schedule(self, channel_id, enabled, expression):
+        from .webhook_schedule import normalize, config_key
+        uid = self.user['id']
+        with self.store.connect(True) as c:
+            if not c.execute("SELECT id FROM channels WHERE id=? AND user_id=? AND url<>''",(channel_id,uid)).fetchone():
+                raise PermissionError('不能修改其他账号的Webhook发送时间')
+            config = normalize({'enabled':enabled,'cron':expression})
+            c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(config_key(uid,channel_id),canonical(config)))
+        return True
 
     def configure_channel(self, channel_id, mode):
         if mode not in MODES:
@@ -444,6 +466,8 @@ class UserService:
             # but erase the credential and prevent re-enabling a deleted entry.
             c.execute("UPDATE channels SET enabled=0,url='' WHERE id=? AND user_id=?",(channel_id,uid))
             c.execute('DELETE FROM settings WHERE key=?',(filter_key(uid,channel_id),))
+            from .webhook_schedule import config_key as schedule_key
+            c.execute('DELETE FROM settings WHERE key=?',(schedule_key(uid,channel_id),))
             c.execute("UPDATE outbox SET status='CANCELLED',claim_until=NULL,claim_owner=NULL WHERE channel_id=? AND user_id=? AND status IN ('PENDING','RETRY','SENDING')",(channel_id,uid))
             from .radar_notifications import cancel_channel, config_key
             cancel_channel(c,uid,channel_id)

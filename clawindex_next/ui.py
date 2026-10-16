@@ -299,6 +299,8 @@ def run():
                 st.caption('机会提醒单独选择，默认关闭。上方渠道关闭时也不发送；它与买入、卖出通知分开，不代表交易指令。')
                 if radar_on and mode=='OFF':
                     st.warning('机会推送已配置，但此Webhook总开关仍关闭。请先在上方“推送方式”开启渠道，才会实际发送。')
+                from .ui_webhook_schedule import schedule_editor
+                schedule_editor(svc,channel,guarded)
                 reveal_key = 'show_webhook_address_'+str(channel['id'])
                 with st.container(horizontal=True):
                     test_saved = st.button('发送测试消息',key='channel_test_'+str(channel['id']))
@@ -329,6 +331,9 @@ def run():
                 new_radar_on = st.checkbox('新Webhook开启机会推送',value=False,help='默认不推送机会；Webhook推送方式为关闭时，全部通知暂停。')
                 new_scopes = [key for key in RADAR_MODES if key!='OFF']
                 new_radar_scope = st.selectbox('新Webhook机会推送范围',new_scopes,format_func=RADAR_MODES.get)
+                from .webhook_schedule import DEFAULT_CRON
+                new_scheduled = st.checkbox('新Webhook按Cron定时发送',value=False)
+                new_cron = st.text_input('新Webhook Cron表达式',value=DEFAULT_CRON,help='北京时间；标准五字段：分 时 日 月 周。默认示例为周一至周五19:30。测试消息不受时段限制。')
                 with st.container(horizontal=True):
                     test = st.form_submit_button('测试：发送你好，世界')
                     save = st.form_submit_button('保存Webhook',type='primary')
@@ -337,7 +342,7 @@ def run():
                         if guarded(lambda:svc.test_webhook(url)):
                             st.success('测试消息“你好，世界”已发送；此地址尚未保存。')
                 if save:
-                    if guarded(lambda:svc.set_channel(url,channel_label,mode=new_mode,radar_mode=new_radar_scope if new_radar_on else 'OFF')):
+                    if guarded(lambda:svc.set_channel(url,channel_label,mode=new_mode,radar_mode=new_radar_scope if new_radar_on else 'OFF',schedule={'enabled':new_scheduled,'cron':new_cron})):
                         st.session_state.webhook_notice = 'Webhook已保存：'+MODES[new_mode]+('；机会推送已配置开启（渠道关闭时暂停）' if new_radar_on else '；机会推送关闭')
                         st.rerun()
         if user["admin"]:

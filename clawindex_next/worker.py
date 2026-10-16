@@ -227,11 +227,19 @@ class Worker:
         self.mark_progress()
         return True
 
-    def deliver(self):
-        instant = datetime.now(timezone.utc)
+    def deliver(self, instant=None):
+        instant = instant or datetime.now(timezone.utc)
         with self.store.connect(True) as c:
             c.execute("UPDATE outbox SET status='FAILED',claim_owner=NULL,claim_until=NULL WHERE attempts>=3 AND (status IN ('PENDING','RETRY') OR (status='SENDING' AND COALESCE(claim_until,'')<=?))",(instant.isoformat(),))
-            row = c.execute("SELECT o.*,c.url FROM outbox o JOIN channels c ON c.id=o.channel_id JOIN personal_decisions d ON d.id=o.decision_id WHERE c.enabled=1 AND c.user_id=o.user_id AND d.user_id=o.user_id AND o.attempts<3 AND o.next_at<=? AND (o.status IN ('PENDING','RETRY') OR (o.status='SENDING' AND o.claim_until<?)) ORDER BY o.id LIMIT 1", (instant.isoformat(),instant.isoformat())).fetchone()
+            from .webhook_schedule import allowed as schedule_allowed
+            schedules = {}
+            def due(candidate):
+                key = (candidate['user_id'],candidate['channel_id'])
+                if key not in schedules:
+                    schedules[key] = schedule_allowed(c,*key,instant)
+                return schedules[key]
+            candidates = c.execute("SELECT o.*,c.url FROM outbox o JOIN channels c ON c.id=o.channel_id JOIN personal_decisions d ON d.id=o.decision_id WHERE c.enabled=1 AND c.user_id=o.user_id AND d.user_id=o.user_id AND o.attempts<3 AND o.next_at<=? AND (o.status IN ('PENDING','RETRY') OR (o.status='SENDING' AND o.claim_until<?)) ORDER BY o.id", (instant.isoformat(),instant.isoformat()))
+            row = next((candidate for candidate in candidates if due(candidate)),None)
             if not row:
                 return False
             decision = json.loads(c.execute("SELECT result FROM personal_decisions WHERE id=?", (row["decision_id"],)).fetchone()[0])
@@ -269,6 +277,12 @@ class Worker:
     def once(self):
         self.pulse()
         jobs = 0
+        deliveries = 0
+        # Check due notifications before potentially lengthy price/AI batches.
+        for _ in range(4):
+            if self.stopping.is_set() or not self.deliver():
+                break
+            deliveries += 1
         # User requests already queued take priority over periodic refresh.
         for _ in range(20):
             if self.stopping.is_set(): break
@@ -283,7 +297,6 @@ class Worker:
             if not self.run_job():
                 break
             jobs += 1
-        deliveries = 0
         for _ in range(100):
             if self.stopping.is_set(): break
             self.pulse()

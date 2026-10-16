@@ -86,7 +86,18 @@ def deliver(store, sender, calendar, instant=None):
     owner = uuid.uuid4().hex
     with store.connect(True) as c:
         c.execute("UPDATE settings SET value=json_set(value,'$.status','FAILED','$.claim_owner',NULL,'$.claim_until',NULL,'$.detail','达到3次尝试上限，最后一次投递中断，未自动重发。') WHERE key LIKE 'radar:notice:%' AND json_extract(value,'$.attempts')>=3 AND (json_extract(value,'$.status') IN ('PENDING','RETRY') OR (json_extract(value,'$.status')='SENDING' AND COALESCE(json_extract(value,'$.claim_until'),'')<=?))",(instant.isoformat(),))
-        row = c.execute("SELECT key,value FROM settings WHERE key LIKE 'radar:notice:%' AND json_extract(value,'$.attempts')<3 AND (json_extract(value,'$.status') IN ('PENDING','RETRY') OR (json_extract(value,'$.status')='SENDING' AND COALESCE(json_extract(value,'$.claim_until'),'')<=?)) AND json_extract(value,'$.next_at')<=? ORDER BY json_extract(value,'$.created_at'),key LIMIT 1",(instant.isoformat(),instant.isoformat())).fetchone()
+        from .webhook_schedule import allowed as schedule_allowed
+        candidates = c.execute("SELECT key,value FROM settings WHERE key LIKE 'radar:notice:%' AND json_extract(value,'$.attempts')<3 AND (json_extract(value,'$.status') IN ('PENDING','RETRY') OR (json_extract(value,'$.status')='SENDING' AND COALESCE(json_extract(value,'$.claim_until'),'')<=?)) AND json_extract(value,'$.next_at')<=? ORDER BY json_extract(value,'$.created_at'),key",(instant.isoformat(),instant.isoformat()))
+        row = None
+        for candidate in candidates:
+            notice = json.loads(candidate['value'])
+            active = c.execute("SELECT enabled FROM channels WHERE id=? AND user_id=? AND url<>''",(notice['channel_id'],notice['user_id'])).fetchone()
+            setting = c.execute('SELECT value FROM settings WHERE key=?',(config_key(notice['user_id'],notice['channel_id']),)).fetchone()
+            choice = json.loads(setting[0]) if setting else 'OFF'
+            # Cancel disabled channels promptly, but do not let a future schedule block other channels.
+            if not active or not active[0] or choice=='OFF' or (choice=='READY' and notice['event_state']!='READY') or schedule_allowed(c,notice['user_id'],notice['channel_id'],instant):
+                row = candidate
+                break
         if not row:
             return False
         item = json.loads(row['value'])

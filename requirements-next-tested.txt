@@ -8,3 +8,4 @@ requests==2.34.2
 exchange-calendars==4.13.2
 pytest==8.4.2
 psutil==5.9.0
+croniter==6.2.4
