@@ -249,7 +249,7 @@ class UserService:
 
     def jobs(self, ids=None):
         from .tasks import reconcile
-        from .worker import worker_status
+        from .background import snapshot, decorate_jobs
         uid = self.user['id']
         reconcile(self.store,uid)
         if ids is not None and not ids:
@@ -257,29 +257,27 @@ class UserService:
         condition = (' AND j.id IN ('+','.join('?' for _ in ids)+')') if ids is not None else ' AND a.active=1'
         params = (uid,*ids) if ids is not None else (uid,)
         rows = self.store.rows("SELECT j.*,a.code,i.name,s.value progress FROM jobs j JOIN assignments a ON a.id=j.assignment_id JOIN instruments i ON i.code=a.code LEFT JOIN settings s ON s.key='progress:'||j.id WHERE a.user_id=?"+condition+" ORDER BY CASE WHEN j.status IN ('PENDING','RUNNING','RETRY') THEN 0 ELSE 1 END,j.created_at DESC"+('' if ids is not None else ' LIMIT 100'),params)
-        ready = worker_status(self.store)
-        instant = datetime.now(timezone.utc)
-        for row in rows:
-            row["progress"] = json.loads(row["progress"]) if row["progress"] else {"phase":"queued","detail":"等待后台处理"}
-            minutes = max(0,int((instant-datetime.fromisoformat(row['created_at'])).total_seconds()/60))
-            row['wait_minutes'] = minutes
-            if row['status'] in ('PENDING','RUNNING','RETRY'):
-                if not ready:
-                    row['queue_state'],row['queue_hint'] = 'OFFLINE','后台当前离线；请求已保存，后台恢复后继续处理'
-                elif row['status'] == 'RUNNING' and (not row['claim_until'] or row['claim_until'] <= instant.isoformat()):
-                    row['queue_state'],row['queue_hint'] = 'RECOVERING','上次执行已中断，等待后台接续'
-                elif row['status'] == 'RETRY':
-                    row['queue_state'],row['queue_hint'] = 'RETRY',row['error'] or '暂时未完成，后台稍后自动重试'
-                elif row['status'] == 'PENDING':
-                    row['queue_state'],row['queue_hint'] = 'PENDING',f'已等待 {minutes} 分钟，后台会优先处理巡检；较久未动请查看健康页' if minutes>=5 else '等待后台处理，尚未开始'
-                else:
-                    row['queue_state'],row['queue_hint'] = 'RUNNING',row['progress']['detail']
-        return rows
+        return decorate_jobs(rows, snapshot(self.store, uid))
 
-    def request_inspection(self, assignment_id, include_ai=True, instant=None):
+    def background_status(self):
+        from .background import public_snapshot
+        return public_snapshot(self.store, self.user['id'])
+
+    def inspection_ai_enabled(self):
+        from .tasks import inspection_ai_enabled
+        return inspection_ai_enabled(self.store, self.user['id'])
+
+    def set_inspection_ai(self, enabled):
+        uid = self.user['id']
+        with self.store.connect(True) as c:
+            c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                      ('inspection_ai:'+str(uid), canonical(bool(enabled))))
+
+    def request_inspection(self, assignment_id, include_ai=None, instant=None):
         """User click: reuse today's current result, or request only missing AI."""
         from .tasks import enqueue, reconcile
         from zoneinfo import ZoneInfo
+        include_ai = self.inspection_ai_enabled() if include_ai is None else bool(include_ai)
         instant = instant or datetime.now(timezone.utc)
         assignment = self._assignment(assignment_id)
         if not assignment['active']:

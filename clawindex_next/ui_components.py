@@ -10,7 +10,8 @@ from .presentation import label, local_time, number, readable
 from .worker import worker_status
 
 
-def start_inspection(svc, watches, include_ai=True, kind="inspection", start=None):
+def start_inspection(svc, watches, include_ai=None, kind="inspection", start=None):
+    include_ai = svc.inspection_ai_enabled() if include_ai is None else include_ai
     ids = []
     skipped,ai_only,changed = 0,0,0
     for watch in watches:
@@ -46,13 +47,14 @@ def loading_progress(svc):
         dismiss_loading()
         st.rerun()
     completed = sum(j["status"] in ("SUCCEEDED","FAILED","CANCELLED") for j in jobs)
-    st.status("正在处理，请稍候…" if completed < len(jobs) else "处理结束",state="running" if completed < len(jobs) else "complete",expanded=False)
+    receiving = completed < len(jobs) and all(j.get('queue_state') == 'STARTING' or j['status'] in ('SUCCEEDED','FAILED','CANCELLED') for j in jobs)
+    st.status("请求已提交，后台准备接收" if receiving else "正在处理，请稍候…" if completed < len(jobs) else "处理结束",state="running" if completed < len(jobs) else "complete",expanded=False)
     st.progress(completed/len(jobs),text=f"已完成 {completed} / {len(jobs)} 项")
     if not worker_status(svc.store):
         st.warning("后台尚未就绪。请求已经保存，请启动页面与后台；恢复后会继续处理。")
     for job in jobs:
         phase = job["progress"]["phase"]
-        title = label(job["status"]) if job["status"] in ("RETRY","FAILED","CANCELLED","SUCCEEDED") else label(phase)
+        title = job.get('queue_title') or (label(job["status"]) if job["status"] in ("RETRY","FAILED","CANCELLED","SUCCEEDED") else label(phase))
         with st.container(border=True):
             st.write(f"**{job['name']}** · {title}")
             st.caption(job.get('queue_hint') or job["error"] or job["progress"]["detail"])
@@ -196,14 +198,30 @@ def signal_dashboard(svc):
 def queue_panel(active):
     if any(j.get('queue_state') == 'OFFLINE' for j in active):
         st.warning(f'有 {len(active)} 项请求等待后台恢复；当前没有后台服务在执行它们。')
-    elif any(j.get('queue_state') in ('RECOVERING','RETRY') or j.get('wait_minutes',0)>=5 and j['status']=='PENDING' for j in active):
+    elif any(j.get('queue_state') in ('RECOVERING','RETRY','DELAYED') for j in active):
         st.warning(f'有 {len(active)} 项请求等待执行、重试或接续，可展开进度查看原因。')
+    elif all(j.get('queue_state') == 'STARTING' for j in active):
+        st.info(f'已提交 {len(active)} 项请求，后台准备接收；无需重复点击。')
+    elif not any(j['status']=='RUNNING' for j in active) and any(j.get('queue_state')=='WAITING' for j in active):
+        st.info(next(j['queue_hint'] for j in active if j.get('queue_state')=='WAITING'))
     else:
         running = sum(j['status']=='RUNNING' for j in active)
         st.info(f'正在处理 {running} 项，等待执行 {len(active)-running} 项；每5秒刷新状态。')
     with st.expander('查看任务进度与原因'):
-        st.dataframe(pd.DataFrame([{'指数':j['name'],'状态':{'OFFLINE':'等待后台启动','RECOVERING':'等待接续'}.get(j.get('queue_state'),label(j['status'])),
+        st.dataframe(pd.DataFrame([{'指数':j['name'],'状态':j.get('queue_title') or label(j['status']),
                                   '说明':j.get('queue_hint') or j['error'] or j['progress']['detail']} for j in active]),hide_index=True,width="stretch")
+
+
+def background_status_panel(svc):
+    state = svc.background_status()
+    if not state['ready']:
+        st.caption('后台状态：未检测到运行心跳，请求会保留，恢复后继续。')
+    elif state['activities']:
+        st.caption('后台当前：'+'；'.join(item['description'] for item in state['activities']))
+    else:
+        st.caption('后台当前没有已登记的执行步骤；新请求等待接收，不代表有其他任务在排队。')
+    if state['own_waiting'] or state['other_waiting']:
+        st.caption(f"待接收巡检或同步：本账号 {state['own_waiting']} 项，其他账号 {state['other_waiting']} 项。其他账号的指数与账户信息不展示。")
 
 
 def ai_action(svc, decision_id, key_prefix, title='生成AI解读', refresh=True):

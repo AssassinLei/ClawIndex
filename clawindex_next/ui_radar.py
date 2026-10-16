@@ -47,6 +47,9 @@ def radar_panel(svc, guarded):
     if not state['enabled']:
         st.info('自动机会扫描已暂停；可点击“刷新机会”提交一次后台扫描。')
     report = state['report']
+    if not report or state['stale'] or report['status']!='COMPLETE':
+        from .ui_components import background_status_panel
+        background_status_panel(svc)
     if not report:
         empty_state('机会雷达正在准备', '后台会建立L1、L2目录，分批准备价格与估值历史。首次需要时间，以后主要更新增量数据，无需手动同步。')
         if state['progress'].get('detail'):

@@ -11,6 +11,14 @@ from clawindex_next.service import UserService
 from clawindex_next.storage import Store, canonical, digest, now
 
 
+@pytest.fixture(autouse=True)
+def isolated_provider_credentials(monkeypatch):
+    # UI dotenv loading must never import real local credentials into regression tests.
+    # Tests that exercise adapters explicitly provide their own fake credentials/provider.
+    monkeypatch.setenv('VNEXT_LLM_API_KEY', '')
+    monkeypatch.setenv('TUSHARE_TOKEN', '')
+
+
 class FixtureCalendar:
     def sessions(self, name, start, end):
         return [d.date().isoformat() for d in pd.bdate_range(start,end)]

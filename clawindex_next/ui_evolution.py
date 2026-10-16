@@ -17,7 +17,7 @@ def evolution_step(latest, config):
         status = latest.get('candidate_status') or latest['status']
         messages = {
             'WAITING_DATA':('进化已提交，等待后台准备行情','缺口由后台自动补齐，准备好后继续；无需手动同步。'),
-            'PENDING':('每日进化排队中','后台将比较规则，通过历史检验后实际更新；可以关闭网页。'),
+            'PENDING':('每日进化已提交','后台将比较规则，通过历史检验后实际更新；可以关闭网页。'),
             'RUNNING':('每日进化正在比较规则','正在检查回撤、少赚的代价、成本与延迟；完成后显示是否更新。'),
             'READY_TO_APPLY':('新规则等待应用','历史检验已通过，后台会复核最新行情、规则及旧提醒投递状态，再完成更新。'),
             'ACTIVE':('每日进化已更新策略','新规则已经生效，后台正在生成新判断；可回“今日操作”查看。此次更新尚无后续行情验证。'),
@@ -75,6 +75,9 @@ def evolution_progress(svc, code):
     title,next_step = evolution_step(latest,policy['payload']['config'])
     st.markdown("**现在的进度："+title+"**")
     st.info("你现在要做的："+next_step)
+    if latest and latest['status'] in ('PENDING','RUNNING','WAITING_DATA'):
+        from .ui_components import background_status_panel
+        background_status_panel(svc)
     current_rule = next((item for item in svc.watchlist() if item['code']==code),None)
     if current_rule:
         spec = json.loads(current_rule['spec'])

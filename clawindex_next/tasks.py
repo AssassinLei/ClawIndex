@@ -10,6 +10,11 @@ ACTIVE = ('PENDING','RUNNING','RETRY')
 TERMINAL = ('SUCCEEDED','FAILED','CANCELLED')
 
 
+def inspection_ai_enabled(store, user_id):
+    rows = store.rows('SELECT value FROM settings WHERE key=?', ('inspection_ai:'+str(user_id),))
+    return not rows or rows[0]['value'] == 'true'
+
+
 def reconcile(store, user_id=None, instant=None):
     """Retire unclaimable jobs without discarding resumable or live work."""
     stamp = (instant or datetime.now(timezone.utc)).isoformat()

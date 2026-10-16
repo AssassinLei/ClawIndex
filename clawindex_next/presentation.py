@@ -25,7 +25,7 @@ LABELS = {
     "EQUITY_INDEX":"股票指数", "EQUITY_SECTOR_INDEX":"股票行业指数", "UNCERTAIN":"数据不足，特征不明确", "MODEL_OK":"AI生成的解读", "TEMPLATE":"程序生成的解读",
     "FAILED_TEMPLATE":"程序生成的解读（AI未成功）",
     "inspection":"巡检", "sync":"行情同步", "worker":"后台服务", "notification":"消息通知", "explanation":"分析解读",
-    "queued":"排队中", "syncing":"正在更新行情", "analyzing":"正在计算信号",
+    "queued":"等待后台接收", "starting":"后台已接收", "syncing":"正在更新行情", "analyzing":"正在计算信号",
     "explaining":"正在生成AI解读", "done":"结果已生成", "failed":"处理失败",
     "close":"收盘点位", "ma60":"60日均线", "ma120":"120日均线", "ma120_slope":"120日均线变化",
     "above":"连续高于均线天数", "below":"连续低于均线天数", "pe_percentile":"市盈率历史分位",

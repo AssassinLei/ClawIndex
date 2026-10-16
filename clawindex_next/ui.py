@@ -34,7 +34,10 @@ def toggle_webhook_address(channel_id):
 def inspection_toolbar(svc,watches):
     with st.container(horizontal=True,vertical_alignment="center"):
         with st.popover("巡检选项"):
-            include_ai = st.checkbox("巡检时同时生成AI解读",value=True,key='inspection_include_ai',help="成功解读会复用。生成AI解读需要模型配置，可能消耗额度。")
+            saved_ai = svc.inspection_ai_enabled()
+            include_ai = st.checkbox("巡检时同时生成AI解读",value=saved_ai,key='inspection_include_ai_'+str(svc.user['id']),help="此设置按账号保存，同时用于手动和后台自动巡检，关闭网页后仍生效。成功解读会复用；需要模型配置，可能消耗额度。")
+            if include_ai != saved_ai:
+                svc.set_inspection_ai(include_ai)
             st.caption("巡检会先检查数据，再生成操作判断。今日相同输入的结果会复用。")
         if st.button("提交全部巡检",type="primary",disabled=not watches,help="日常更新由后台自动完成；需要立即检查时可点击。"):
             guarded(lambda:start_inspection(svc,watches,include_ai))
@@ -342,12 +345,15 @@ def run():
             if choice != enabled:
                 svc.set_scheduler(choice)
         st.info("后台持续运行时才能自动更新与巡检。自动行情更新默认开启，自动巡检保留原设置，消息渠道由你单独开启。")
+        st.caption('本账号自动巡检AI解读：'+('开启' if svc.inspection_ai_enabled() else '关闭')+'。可在“今日操作”的“巡检选项”修改，保存后自动巡检也会使用。')
     elif page == "健康":
         if worker_status(db):
             st.success("后台服务最近10分钟内有运行心跳。页面的任务列表需要刷新后查看最新状态。")
         else:
             st.warning("未检测到后台服务心跳。Pending＝等待执行；后台恢复后会继续处理。云服务器请检查 worker 服务，本地请使用一键启动。")
-        st.write("排队 → 更新行情 → 分析 → 生成解读 → 完成。失败任务会说明原因并最多尝试3次。")
+        from .ui_components import background_status_panel
+        background_status_panel(svc)
+        st.write("提交 → 后台接收 → 更新行情 → 分析 → 按设置生成AI解读 → 完成。失败任务会说明原因并最多尝试3次。")
         if st.button("刷新运行状态",type="primary"):
             st.rerun()
         with st.expander("高级排查与临时恢复"):
@@ -361,7 +367,7 @@ def run():
         st.header("最近运行记录")
         st.dataframe(pd.DataFrame([{"模块":label(r["component"]),"状态":label(r["status"]),"说明":readable(r["detail"]),"时间":local_time(r["created_at"])} for r in svc.health()]),hide_index=True)
         with st.expander("任务明细"):
-            st.dataframe(pd.DataFrame([{"指数":r["name"],"任务状态":label(r["status"]),"当前阶段":label(r["progress"]["phase"]),"说明":r["error"] or r["progress"]["detail"],"更新时间":local_time(r["updated_at"])} for r in svc.jobs()]),hide_index=True)
+            st.dataframe(pd.DataFrame([{"指数":r["name"],"任务状态":r.get('queue_title') or label(r["status"]),"当前阶段":label(r["progress"]["phase"]),"说明":r.get('queue_hint') or r["error"] or r["progress"]["detail"],"更新时间":local_time(r["updated_at"])} for r in svc.jobs()]),hide_index=True)
     if not watches and page not in ("监控与数据","通知与运行","健康","发现机会"):
         if page != "今日操作":
             empty_state("先添加一个关注的指数", "添加后即可管理持仓、查看策略与历史判断。")

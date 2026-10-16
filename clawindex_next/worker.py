@@ -10,7 +10,8 @@ from .calendar import MarketCalendar, grace_for
 from .service import Evaluator
 from .storage import canonical, digest, now
 from .syncing import MarketSync, error_message
-from .tasks import enqueue, progress, request_for, reconcile
+from .tasks import enqueue, progress, request_for, reconcile, inspection_ai_enabled
+from .background import activity
 from .webhooks import allows, channel_mode, operation_payload
 
 
@@ -48,13 +49,14 @@ class Worker:
         from .engine import ALGORITHM
         revision = self.store.rows('SELECT MAX(id) n FROM observations WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)',(code,expected,instant.isoformat()))[0]['n']
         for assignment in (a for a in assignments if a['code']==code):
+            include_ai = inspection_ai_enabled(self.store, assignment['user_id'])
             context = [self.store.rows(f'SELECT MAX(id) n FROM {table} WHERE user_id=? AND code=?',(assignment['user_id'],code))[0]['n'] for table in ('position_reports','budgets','product_mappings')]
-            value = digest({'revision':revision,'context':context,'expected':expected,'algorithm':ALGORITHM,'evaluation_day':instant.date().isoformat()})
+            value = digest({'revision':revision,'context':context,'expected':expected,'algorithm':ALGORITHM,'evaluation_day':instant.date().isoformat(),'include_ai':include_ai})
             key = 'auto_inspect:'+str(assignment['id'])
             previous = self.store.rows('SELECT value FROM settings WHERE key=?',(key,))
             if previous and previous[0]['value']==value:
                 continue
-            enqueue(self.store,assignment['id'],refresh=False)
+            enqueue(self.store,assignment['id'],refresh=False,include_ai=include_ai)
             with self.store.connect(True) as c:
                 c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
 
@@ -71,7 +73,8 @@ class Worker:
         try:
             if settings.get('daily_sync_enabled','true') == 'true':
                 from .catalog import refresh
-                refresh(self.store,self.syncer.provider,instant)
+                with activity(self.store,self.owner,'catalog'):
+                    refresh(self.store,self.syncer.provider,instant)
             assignments = self.store.rows("SELECT * FROM assignments WHERE active=1")
             for code in sorted({a["code"] for a in assignments}):
                 if self.stopping.is_set():
@@ -108,7 +111,8 @@ class Worker:
                         continue
                     with self.store.connect(True) as c:
                         c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (attempt_key,instant.isoformat()))
-                    detail = self.syncer.refresh(code,instant=instant)
+                    with activity(self.store,self.owner,'sync',code=code):
+                        detail = self.syncer.refresh(code,instant=instant)
                     with self.store.connect(True) as c:
                         c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (daily_key,canonical({"day":local.date().isoformat(),"expected":expected})))
                     self.store.health("sync","OK",f"{code}: {detail}")
@@ -171,10 +175,15 @@ class Worker:
         with self.store.connect(True) as c:
             c.execute("UPDATE jobs SET status='FAILED',error='工作进程在最后一次尝试中终止；租约已过期',updated_at=? WHERE status='RUNNING' AND attempts>=3 AND claim_until<? AND (? IS NULL OR assignment_id IN (SELECT id FROM assignments WHERE user_id=?))", (instant.isoformat(),instant.isoformat(),user_id,user_id))
             retry_before = (instant-timedelta(seconds=30)).isoformat()
-            job = c.execute("SELECT j.* FROM jobs j JOIN assignments a ON a.id=j.assignment_id WHERE a.active=1 AND (? IS NULL OR a.user_id=?) AND j.attempts<3 AND (j.status='PENDING' OR (j.status='RETRY' AND j.updated_at<=?) OR (j.status='RUNNING' AND COALESCE(j.claim_until,'')<=?)) ORDER BY j.created_at LIMIT 1", (user_id,user_id,retry_before,instant.isoformat())).fetchone()
+            job = c.execute("SELECT j.*,a.user_id,a.code FROM jobs j JOIN assignments a ON a.id=j.assignment_id WHERE a.active=1 AND (? IS NULL OR a.user_id=?) AND j.attempts<3 AND (j.status='PENDING' OR (j.status='RETRY' AND j.updated_at<=?) OR (j.status='RUNNING' AND COALESCE(j.claim_until,'')<=?)) ORDER BY j.created_at,j.id LIMIT 1", (user_id,user_id,retry_before,instant.isoformat())).fetchone()
             if not job:
                 return False
             c.execute("UPDATE jobs SET status='RUNNING',attempts=attempts+1,claim_owner=?,claim_until=?,updated_at=? WHERE id=?", (self.owner,(instant+timedelta(minutes=5)).isoformat(),now(),job["id"]))
+            c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ('progress:'+job['id'],canonical({'phase':'starting','detail':'后台已接收，正在准备本次任务','updated_at':now()})))
+        with activity(self.store,self.owner,'job',job_id=job['id'],user_id=job['user_id']):
+            return self.execute_job(job)
+
+    def execute_job(self, job):
         try:
             stop = threading.Event()
             def keepalive():
@@ -244,7 +253,8 @@ class Worker:
             c.execute("UPDATE outbox SET status='SENDING',attempts=attempts+1,claim_until=?,claim_owner=? WHERE id=?", ((instant+timedelta(seconds=45)).isoformat(),self.owner,row["id"]))
         try:
             # Rebuild even old queued messages in the new minimal format.
-            self.sender(row["url"],operation_payload(item['name'],decision['action']))
+            with activity(self.store,self.owner,'notification'):
+                self.sender(row["url"],operation_payload(item['name'],decision['action']))
             status,detail = "SENT","HTTP及飞书业务码均成功"
         except Exception as exc:
             status = "FAILED" if row["attempts"]+1 >= 3 else "RETRY"
@@ -284,15 +294,19 @@ class Worker:
             try:
                 from .radar_notifications import deliver
                 for _ in range(4):
-                    if self.stopping.is_set() or not deliver(self.store,self.sender,self.syncer.calendar):
+                    if self.stopping.is_set():
                         break
+                    with activity(self.store,self.owner,'notification'):
+                        if not deliver(self.store,self.sender,self.syncer.calendar):
+                            break
                     self.pulse()
             finally:
                 self.release('radar_notices')
         if not self.stopping.is_set() and self.lease("evolution",seconds=300):
             try:
                 from .evolution import Evolution
-                Evolution(self.store,self.evaluator,self.owner).tick()
+                with activity(self.store,self.owner,'evolution'):
+                    Evolution(self.store,self.evaluator,self.owner).tick()
             finally:
                 self.release("evolution")
         if not self.stopping.is_set() and self.lease('opportunity_radar',seconds=180):
@@ -302,12 +316,24 @@ class Worker:
                     self.pulse()
                     self.lease('opportunity_radar',seconds=180)
                     self.mark_progress()
-                Radar(self.store,self.syncer.calendar,self.syncer.provider).tick(heartbeat=heartbeat)
+                with activity(self.store,self.owner,'radar'):
+                    Radar(self.store,self.syncer.calendar,self.syncer.provider).tick(heartbeat=heartbeat)
             except Exception:
                 self.store.health('radar','WAITING','机会雷达本轮暂未完成，后台将自动重试，已有监控继续运行。')
             finally:
                 self.release('opportunity_radar')
         return {"jobs_processed":jobs,"deliveries_processed":deliveries}
+
+    def wait_for_work(self, interval):
+        """Poll only the lightweight queue while idle, without rerunning periodic work."""
+        deadline = time.monotonic()+interval
+        while not self.stopping.is_set():
+            instant = datetime.now(timezone.utc)
+            ready = self.store.rows("SELECT j.id FROM jobs j JOIN assignments a ON a.id=j.assignment_id WHERE a.active=1 AND j.attempts<3 AND (j.status='PENDING' OR (j.status='RETRY' AND j.updated_at<=?) OR (j.status='RUNNING' AND COALESCE(j.claim_until,'')<=?)) LIMIT 1", ((instant-timedelta(seconds=30)).isoformat(),instant.isoformat()))
+            remaining = deadline-time.monotonic()
+            if ready or remaining<=0:
+                return
+            self.stopping.wait(min(2,remaining))
 
     def run(self, interval=30):
         failures = 0
@@ -333,7 +359,11 @@ class Worker:
                     self.store.health("worker","FAILED","后台循环异常；30秒后重试，查看任务状态及配置")
                     if failures >= 3:
                         raise RuntimeError('后台连续异常，退出以便云端重启') from None
-                self.stopping.wait(interval)
+                if failures:
+                    self.stopping.wait(interval)
+                else:
+                    with activity(self.store,self.owner,'idle'):
+                        self.wait_for_work(interval)
         finally:
             watchdog_stop.set()
             guardian.join(timeout=2)
