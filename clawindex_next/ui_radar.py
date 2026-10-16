@@ -7,6 +7,7 @@ import streamlit as st
 from .presentation import local_time, number, label
 from .radar_rules import KINDS, STATES
 from .ui_design import card_heading, empty_state, summary_stats
+from .industry_hierarchy import parent_label
 
 
 def act(svc, action, code):
@@ -77,6 +78,8 @@ def radar_panel(svc, guarded):
         with st.container(border=True):
             card_heading(row['name'],row['code'],STATES[row['state']],'quiet' if row['state']=='WATCH' else 'buy')
             st.caption(('一级行业' if row['level']=='L1' else '二级行业')+' · '+KINDS[row['kind']]+' · 来源：程序筛选')
+            if row['level']=='L2':
+                st.caption(parent_label(row))
             for reason in row['reasons']:
                 st.write('• '+reason)
             cols = st.columns(3)
@@ -107,8 +110,8 @@ def radar_panel(svc, guarded):
             st.caption('尚未隐藏任何指数。')
     with st.expander('完整筛选与撤销记录'):
         st.caption('未入选和数据准备中的指数也留存。没有因过去表现好就声称能赚钱。')
-        st.dataframe(pd.DataFrame([{'指数':r['name'],'代码':r['code'],'级别':r['level'],'状态':STATES[r['state']],
-                                  '类型':KINDS.get(r['kind'],'—'),'依据或排除原因':'；'.join(r['reasons'])} for r in report['rows']]),hide_index=True,width='stretch')
+        st.dataframe(pd.DataFrame([{'指数':r['name'],'代码':r['code'],'级别':r['level'],'所属一级行业':parent_label(r).removeprefix('所属一级行业：') or '—','状态':STATES[r['state']],
+                                  '类型':KINDS.get(r['kind'],'—'),'依据或排除原因':'；'.join(r['reasons'])} for r in state['display_rows']]),hide_index=True,width='stretch')
         if report['events']:
             descriptions = {'NEW':'新进入候选','READY':'研究入场条件满足','WITHDRAWN':'条件失效，撤销','SCOPE_REMOVED':'已移出扫描范围'}
             st.dataframe(pd.DataFrame([{'指数代码':r['code'],'变化':descriptions[r['kind']]} for r in report['events']]),hide_index=True)

@@ -290,10 +290,15 @@ def run():
                     st.success('已保存：'+MODES[mode])
                 from .radar_notifications import MODES as RADAR_MODES
                 radar_mode = svc.radar_channel_mode(channel['id'])
-                radar_choice = st.selectbox('机会雷达提醒',list(RADAR_MODES),index=list(RADAR_MODES).index(radar_mode),format_func=RADAR_MODES.get,key='radar_channel_'+str(channel['id']))
+                radar_on = st.checkbox('开启机会推送',value=radar_mode!='OFF',key='radar_on_'+str(channel['id']),help='只控制这个Webhook的机会提醒，其他Webhook不受影响。关闭后取消尚未发送的机会提醒。')
+                scopes = [key for key in RADAR_MODES if key!='OFF']
+                radar_scope = st.selectbox('机会推送范围',scopes,index=scopes.index(radar_mode) if radar_mode in scopes else 0,format_func=RADAR_MODES.get,key='radar_scope_'+str(channel['id']),disabled=not radar_on)
+                radar_choice = radar_scope if radar_on else 'OFF'
                 if radar_choice!=radar_mode and guarded(lambda:svc.set_radar_channel(channel['id'],radar_choice)):
                     st.success('机会提醒设置已保存。')
                 st.caption('机会提醒单独选择，默认关闭。上方渠道关闭时也不发送；它与买入、卖出通知分开，不代表交易指令。')
+                if radar_on and mode=='OFF':
+                    st.warning('机会推送已配置，但此Webhook总开关仍关闭。请先在上方“推送方式”开启渠道，才会实际发送。')
                 reveal_key = 'show_webhook_address_'+str(channel['id'])
                 with st.container(horizontal=True):
                     test_saved = st.button('发送测试消息',key='channel_test_'+str(channel['id']))
@@ -320,6 +325,10 @@ def run():
                 url = st.text_input("飞书机器人通知地址",type="password",help='填写后可先发送测试消息，无需保存，也无需开启正式推送。')
                 channel_label = st.text_input("渠道名称",placeholder="例如：我的投资提醒")
                 new_mode = st.selectbox('新Webhook推送方式',list(MODES),format_func=MODES.get)
+                from .radar_notifications import MODES as RADAR_MODES
+                new_radar_on = st.checkbox('新Webhook开启机会推送',value=False,help='默认不推送机会；Webhook推送方式为关闭时，全部通知暂停。')
+                new_scopes = [key for key in RADAR_MODES if key!='OFF']
+                new_radar_scope = st.selectbox('新Webhook机会推送范围',new_scopes,format_func=RADAR_MODES.get)
                 with st.container(horizontal=True):
                     test = st.form_submit_button('测试：发送你好，世界')
                     save = st.form_submit_button('保存Webhook',type='primary')
@@ -328,8 +337,8 @@ def run():
                         if guarded(lambda:svc.test_webhook(url)):
                             st.success('测试消息“你好，世界”已发送；此地址尚未保存。')
                 if save:
-                    if guarded(lambda:svc.set_channel(url,channel_label,mode=new_mode)):
-                        st.session_state.webhook_notice = 'Webhook已保存：'+MODES[new_mode]
+                    if guarded(lambda:svc.set_channel(url,channel_label,mode=new_mode,radar_mode=new_radar_scope if new_radar_on else 'OFF')):
+                        st.session_state.webhook_notice = 'Webhook已保存：'+MODES[new_mode]+('；机会推送已配置开启（渠道关闭时暂停）' if new_radar_on else '；机会推送关闭')
                         st.rerun()
         if user["admin"]:
             st.header("后台自动运行")

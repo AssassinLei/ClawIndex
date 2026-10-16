@@ -111,7 +111,11 @@ def deliver(store, sender, calendar, instant=None):
     else:
         state = 'WITHDRAWN' if item['kind']=='WITHDRAWN' else current['state']
         try:
-            sender(channel['url'],{'radar_name':current['name'],'radar_state':state})
+            from .industry_hierarchy import enrich_rows
+            from .radar import universe
+            from .webhooks import opportunity_payload
+            current = enrich_rows([current],universe(store))[0]
+            sender(channel['url'],opportunity_payload(current,state))
             status,detail = 'SENT','机会提醒已发送，HTTP与飞书业务码均成功。'
         except Exception as exc:
             status = 'FAILED' if item['attempts']>=3 else 'RETRY'

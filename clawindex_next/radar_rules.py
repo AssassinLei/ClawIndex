@@ -139,6 +139,8 @@ def analyze(items, frames, benchmark, sources=None):
         if breadth<RULE['minimum_breadth']:
             market.update(entry_allowed=False,reason='多数已覆盖行业的中期表现仍弱，保留观察')
             rows = [classify(item,frames.get(item['code'],pd.DataFrame()),benchmark,market) for item in items]
+    from .industry_hierarchy import enrich_rows
+    rows = enrich_rows(rows, items)
     correlations = {}
     eligible = [r for r in rows if r['state'] in ('READY','WATCH')]
     for i,a in enumerate(eligible):

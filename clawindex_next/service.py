@@ -375,8 +375,11 @@ class UserService:
             rows = [dict(r) for r in c.execute("SELECT id,label,enabled FROM channels WHERE user_id=? AND url<>'' ORDER BY id",(uid,))]
             return [{**r,'mode':channel_mode(c,r['id'],uid,r['enabled'])} for r in rows]
 
-    def set_channel(self, url, label, enabled=False, mode=None):
+    def set_channel(self, url, label, enabled=False, mode=None, radar_mode='OFF'):
         url = validate_url(url)
+        from .radar_notifications import MODES as RADAR_MODES, config_key
+        if radar_mode not in RADAR_MODES:
+            raise ValueError('机会提醒方式无效')
         mode = mode if mode is not None else 'BUY_SELL' if enabled else 'OFF'
         if mode not in MODES:
             raise ValueError('推送方式无效')
@@ -385,6 +388,7 @@ class UserService:
             cid = c.execute("INSERT INTO channels(user_id,url,label,enabled) VALUES(?,?,?,?)", (uid,url,label,int(mode!='OFF'))).lastrowid
             if mode!='OFF':
                 c.execute('INSERT INTO settings VALUES(?,?)',(filter_key(uid,cid),mode))
+            c.execute('INSERT INTO settings VALUES(?,?)',(config_key(uid,cid),canonical(radar_mode)))
             return cid
 
     def configure_channel(self, channel_id, mode):

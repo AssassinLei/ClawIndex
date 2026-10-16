@@ -41,7 +41,7 @@ def test_per_user_per_channel_filters_and_safe_payload(radar_seed):
     sent = []
     while deliver(db,lambda url,p:sent.append(p),FixtureCalendar(),T0):pass
     assert len(sent)==len(queue)
-    assert all(set(p)=={'radar_name','radar_state'} for p in sent)
+    assert all({'radar_name','radar_state'} <= set(p) <= {'radar_name','radar_state','radar_level','radar_parent'} for p in sent)
     assert 'test-placeholder' not in canonical(notices(db))
     assert not db.rows('SELECT * FROM outbox')
     assert all(r['status']=='SENT' for r in notices(db))

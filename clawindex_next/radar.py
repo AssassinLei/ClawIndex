@@ -286,14 +286,16 @@ def view(store, uid, watches, calendar=None, instant=None):
     instant = instant or datetime.now(timezone.utc)
     calendar = calendar or MarketCalendar()
     report = latest(store)
-    base = {'report':report,'progress':read(store,'radar:progress',{}),'enabled':enabled(store),'candidates':[],
+    base = {'report':report,'display_rows':[],'progress':read(store,'radar:progress',{}),'enabled':enabled(store),'candidates':[],
             'suppressed':[],'stale':False,'preferences':preferences(store,uid)}
     if not report:
         return base
+    from .industry_hierarchy import enrich_rows
+    base['display_rows'] = enrich_rows(report['rows'], universe(store))
     base['stale'] = report['as_of']!=expected(calendar,instant) or report['rule_id']!=RULE_ID
     if base['stale'] or report['status']!='COMPLETE':
         return base
     prefs = base['preferences']
     excluded = set(prefs['ignored'])|({r['code'] for r in watches} if prefs['hide_watched'] else set())
-    base['candidates'],base['suppressed'] = select(report['rows'],report['correlations'],excluded)
+    base['candidates'],base['suppressed'] = select(base['display_rows'],report['correlations'],excluded)
     return base

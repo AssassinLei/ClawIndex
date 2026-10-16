@@ -47,14 +47,29 @@ def operation_payload(index_name, action):
     return {'index_name':index_name,'action':action}
 
 
+def opportunity_payload(row, state):
+    payload = {'radar_name':row['name'],'radar_state':state}
+    if row.get('level') == 'L2':
+        payload.update(radar_level='L2',radar_parent=row.get('parent_index'))
+    return payload
+
+
 def message_body(payload):
     if 'radar_name' in payload:
         names = {'READY':'研究入场条件满足','WATCH':'新增观察机会','WITHDRAWN':'机会已撤销'}
         if not isinstance(payload['radar_name'],str) or not payload['radar_name'].strip() or payload.get('radar_state') not in names:
             raise ValueError('机会提醒缺少有效名称或状态')
+        text = '机会雷达｜'+names[payload['radar_state']]
+        if payload.get('radar_level') == 'L2':
+            parent = payload.get('radar_parent')
+            if parent is not None and (not isinstance(parent,dict) or set(parent)!={'name','code'} or
+                                       not all(isinstance(parent[k],str) and parent[k].strip() for k in ('name','code'))):
+                raise ValueError('机会提醒的一级行业资料无效')
+            text += '\n所属一级行业：'+(parent['name']+'（'+parent['code']+'）' if parent else '暂未确认')
+        text += '\n研究观察，不是买入指令。操作请查看系统。'
         return {'msg_type':'interactive','card':{
             'header':{'title':{'tag':'plain_text','content':payload['radar_name']}},
-            'elements':[{'tag':'div','text':{'tag':'plain_text','content':'机会雷达｜'+names[payload['radar_state']]+'\n研究观察，不是买入指令。操作请查看系统。'}}],
+            'elements':[{'tag':'div','text':{'tag':'plain_text','content':text}}],
         }}
     if 'index_name' in payload:
         message = operation_payload(payload['index_name'],payload.get('action'))
