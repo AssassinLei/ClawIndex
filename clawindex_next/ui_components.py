@@ -92,6 +92,8 @@ def explanation_panel(record):
     st.markdown("#### "+explanation_title(record))
     if record['status']=='MODEL_OK':
         st.caption("内容来源：AI。下方摘要、反面观点、分析局限和情景说明均由AI根据程序证据生成。")
+        if payload.get('reuse'):
+            st.caption('当前指标和规则判断未变化，已复用已有AI解读，未再次调用模型。原生成时间：'+local_time(payload['reuse']['original_generated_at']))
     elif record['status'] in ('TEMPLATE','FAILED_TEMPLATE'):
         st.caption("内容来源：程序固定模板。下方摘要和风险说明由程序生成，不是AI生成的内容。")
     else:
@@ -124,6 +126,20 @@ def evidence_panel(db, signal, expanded=False):
         st.write("数据状态："+label(signal["data_status"]))
         feature = json.loads(db.rows("SELECT payload FROM feature_snapshots WHERE id=?", (signal["feature_id"],))[0]["payload"])
         spec = json.loads(db.rows("SELECT spec FROM strategy_versions WHERE id=?", (signal["strategy_id"],))[0]["spec"])
+        if signal['data_status'] == 'INSUFFICIENT_DATA':
+            details = signal.get('data_readiness')
+            if not details:
+                from .data_maintenance import readiness
+                from .engine import feature_frame
+                manifest = json.loads(db.rows('SELECT manifest FROM datasets WHERE id=?',(signal['dataset_id'],))[0]['manifest'])
+                details = readiness(feature_frame(manifest['data'],manifest['sessions'],spec),manifest['data'],spec)
+            st.warning(f"有最新点位，但规则需要最近 {details['required_sessions']} 个连续有效交易日；当前连续有效 {details['continuous_valid_sessions']} 个。")
+            if details['short_sessions']:
+                st.caption(f"这份分析的历史范围还少 {details['short_sessions']} 个交易日。")
+            for field,title in (('missing_dates','缺少行情的交易日'),('invalid_dates','开高低收不完整、数值异常或来源待核实的交易日')):
+                if details[field]:
+                    st.caption(title+'：'+'、'.join(details[field][:8])+('等' if len(details[field])>8 else ''))
+            st.caption('后台会按重试时间自动补齐并重新巡检；不会用前一天价格填补缺口。')
         ma_key = f"ma{spec['ma']}"
         cols = st.columns(3)
         cols[0].metric("指数收盘点位",number(feature.get("close")))

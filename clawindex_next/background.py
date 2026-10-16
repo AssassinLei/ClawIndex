@@ -59,6 +59,8 @@ def snapshot(store, user_id, instant=None):
                 'radar':'扫描机会并补充行业历史',
                 'notification':'发送通知',
             }.get(kind)
+            if kind == 'sync' and current.get('reason'):
+                description += '（历史或指标缺口到期补充）' if current['reason']=='repair' else '（检查最近已发布行情）'
         if description:
             activities.append({'kind':kind, 'description':description,
                                'job_id':current.get('job_id') if current.get('user_id') == user_id else None})

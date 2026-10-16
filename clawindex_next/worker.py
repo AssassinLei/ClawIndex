@@ -51,12 +51,37 @@ class Worker:
         for assignment in (a for a in assignments if a['code']==code):
             include_ai = inspection_ai_enabled(self.store, assignment['user_id'])
             context = [self.store.rows(f'SELECT MAX(id) n FROM {table} WHERE user_id=? AND code=?',(assignment['user_id'],code))[0]['n'] for table in ('position_reports','budgets','product_mappings')]
-            value = digest({'revision':revision,'context':context,'expected':expected,'algorithm':ALGORITHM,'evaluation_day':instant.date().isoformat(),'include_ai':include_ai})
+            local_day = instant.astimezone(ZoneInfo('Asia/Hong_Kong')).date().isoformat()
+            value = digest({'revision':revision,'context':context,'expected':expected,'algorithm':ALGORITHM,'evaluation_day':local_day,'include_ai':include_ai})
             key = 'auto_inspect:'+str(assignment['id'])
             previous = self.store.rows('SELECT value FROM settings WHERE key=?',(key,))
             if previous and previous[0]['value']==value:
                 continue
-            enqueue(self.store,assignment['id'],refresh=False,include_ai=include_ai)
+            # Reuse current manual results too, rather than having an independent
+            # automatic receipt run the same rule/AI again later that day.
+            current = self.store.rows('SELECT d.id decision_id,d.result decision,s.id signal_id,s.result signal,f.algorithm FROM current_signals v JOIN signal_runs s ON s.id=v.signal_id JOIN feature_snapshots f ON f.id=s.feature_id JOIN personal_decisions d ON d.signal_id=s.id WHERE v.assignment_id=? AND d.user_id=? ORDER BY d.created_at DESC,d.id DESC LIMIT 1',(assignment['id'],assignment['user_id']))
+            reusable = False
+            decision_id = None
+            if current:
+                row = current[0]
+                signal,decision = json.loads(row['signal']),json.loads(row['decision'])
+                evaluated_day = datetime.fromisoformat(signal['evaluated_at']).astimezone(ZoneInfo('Asia/Hong_Kong')).date().isoformat()
+                refs = decision.get('context_refs',{})
+                reusable = (evaluated_day==local_day and signal['as_of']==expected and row['algorithm']==ALGORITHM and
+                            signal['data_status'] in ('OK','INSUFFICIENT_DATA') and decision['expires_at']>instant.isoformat() and
+                            [refs.get(k) for k in ('report','budget','mapping')]==context)
+                if reusable:
+                    from .decision_lifecycle import evidence_current
+                    with self.store.connect() as c:
+                        reusable = evidence_current(c,row['signal_id'],code,expected,instant)
+                decision_id = row['decision_id']
+            if reusable and include_ai:
+                from .explanations import model_identity
+                ai = self.store.rows("SELECT id FROM explanations WHERE decision_id=? AND model=? AND status='MODEL_OK'",(decision_id,model_identity()))
+                if not ai:
+                    enqueue(self.store,assignment['id'],refresh=False,include_ai=True,kind='explanation',decision_id=decision_id)
+            elif not reusable:
+                enqueue(self.store,assignment['id'],refresh=False,include_ai=include_ai)
             with self.store.connect(True) as c:
                 c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
 
@@ -72,9 +97,10 @@ class Worker:
             return
         try:
             if settings.get('daily_sync_enabled','true') == 'true':
-                from .catalog import refresh
-                with activity(self.store,self.owner,'catalog'):
-                    refresh(self.store,self.syncer.provider,instant)
+                from .catalog import refresh, refresh_due
+                if refresh_due(self.store,instant):
+                    with activity(self.store,self.owner,'catalog'):
+                        refresh(self.store,self.syncer.provider,instant)
             assignments = self.store.rows("SELECT * FROM assignments WHERE active=1")
             for code in sorted({a["code"] for a in assignments}):
                 if self.stopping.is_set():
@@ -111,7 +137,7 @@ class Worker:
                         continue
                     with self.store.connect(True) as c:
                         c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (attempt_key,instant.isoformat()))
-                    with activity(self.store,self.owner,'sync',code=code):
+                    with activity(self.store,self.owner,'sync',code=code,reason='repair' if repair_due else 'daily'):
                         detail = self.syncer.refresh(code,instant=instant)
                     with self.store.connect(True) as c:
                         c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (daily_key,canonical({"day":local.date().isoformat(),"expected":expected})))

@@ -72,6 +72,10 @@ class MarketSync:
                 if not c.execute("SELECT name FROM leases WHERE name=? AND owner=?", (key,owner)).fetchone():
                     raise ProviderError("SYNC_BUSY: 更新租约已失效，请重试")
                 c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key,canonical({"status":"OK","expected":expected,"checked_at":instant.isoformat()})))
+            repair = self.store.rows('SELECT value FROM settings WHERE key=?',('history_repair:'+code,))
+            state = json.loads(repair[0]['value']) if repair else {}
+            if state.get('missing_sessions',0)>0:
+                return f"最新行情至 {expected}；历史仍有 {state['missing_sessions']} 个缺口，后台分批补充"
             return "行情已更新至 "+expected
         finally:
             stop.set()

@@ -298,6 +298,13 @@ class UserService:
                 expected = None
             revision = self.store.rows('SELECT MAX(id) v FROM observations WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)',(assignment['code'],expected or '',instant.isoformat()))[0]['v']
             current = signal['data_status'] in ('OK','INSUFFICIENT_DATA') and row['as_of'] == expected and decision.get('context_refs') == refs and decision['expires_at'] > instant.isoformat() and revision == dataset_revision
+            if signal['data_status'] == 'INSUFFICIENT_DATA':
+                repair = self.store.rows('SELECT value FROM settings WHERE key=?',('history_repair:'+assignment['code'],))
+                state = json.loads(repair[0]['value']) if repair else {}
+                # An incomplete result is reusable only until automatic repair
+                # becomes due. A successful "today" receipt must not trap gaps.
+                if not repair or state.get('pending') and state.get('next_due','')<=instant.isoformat():
+                    current = False
             if current:
                 from .decision_lifecycle import evidence_current
                 with self.store.connect() as c:
@@ -589,6 +596,9 @@ class Evaluator:
             raise ValueError("NO_DATA: 没有可用行情")
         expected = self.calendar.expected(item["calendar"],instant,grace_for(item))
         rows = [r for r in rows if r["trade_date"] <= expected]
+        if code == 'HKTECH':
+            from .data_maintenance import history_start
+            rows = [r for r in rows if r['trade_date']>=history_start(item)]
         if not rows:
             raise ValueError("NO_DATA: 没有已完成时段行情")
         last = rows[-1]["trade_date"]
@@ -610,6 +620,9 @@ class Evaluator:
         feature = features_at(frame,manifest["as_of"])
         if quality != "OK":
             signal = step(feature,signal["model_state"],spec,manifest["as_of"],signal["triggered_at"],quality)
+        if signal['data_status'] == 'INSUFFICIENT_DATA':
+            from .data_maintenance import readiness
+            signal['data_readiness'] = readiness(frame,manifest['data'],spec)
         dataset_id = digest(manifest)
         feature_id = digest({"dataset":dataset_id,"algorithm":ALGORITHM,"spec":spec,"feature":feature})
         signal.update(code=assignment["code"],strategy_id=assignment["strategy_id"],dataset_id=dataset_id,feature_id=feature_id,evaluated_at=instant.isoformat(),initial_state="FLAT",replay_start=manifest["start"],research_stage=assignment["stage"])

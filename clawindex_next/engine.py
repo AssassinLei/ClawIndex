@@ -9,7 +9,7 @@ import pandas as pd
 
 from .storage import digest
 
-ALGORITHM = "factor_features_v3"
+ALGORITHM = "factor_features_v4"
 DEFAULT_SPEC = {"name":"trend_confirm_v1", "ma":120, "confirmation":3, "slope_window":5, "valuation_window":1250, "annual_sessions":252}
 
 

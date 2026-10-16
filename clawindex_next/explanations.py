@@ -52,17 +52,27 @@ def validate_explanation(raw, features):
 
 
 def explain(store, decision_id, provider=None, model="TEMPLATE"):
-    row = store.rows("SELECT d.result decision,s.result signal,f.payload features FROM personal_decisions d JOIN signal_runs s ON s.id=d.signal_id JOIN feature_snapshots f ON f.id=s.feature_id WHERE d.id=?", (decision_id,))[0]
-    payload = {k:json.loads(v) for k,v in row.items()}
+    row = store.rows("SELECT d.result decision,s.result signal,f.payload features,d.user_id,a.code FROM personal_decisions d JOIN signal_runs s ON s.id=d.signal_id JOIN feature_snapshots f ON f.id=s.feature_id JOIN assignments a ON a.id=s.assignment_id WHERE d.id=?", (decision_id,))[0]
+    payload = {k:json.loads(row[k]) for k in ('decision','signal','features')}
+    # Audit IDs and timestamps change during old-history repair even when the
+    # current evidence and action are identical. They are not prose evidence.
+    payload['signal'] = {k:v for k,v in payload['signal'].items() if k not in ('dataset_id','feature_id','evaluated_at','replay_start')}
+    payload['decision'] = {k:v for k,v in payload['decision'].items() if k not in ('context_refs','expires_at')}
     input_hash = digest({"payload":payload,"prompt_version":PROMPT_VERSION})
     old = store.rows("SELECT * FROM explanations WHERE decision_id=? AND input_hash=? AND model=?", (decision_id,input_hash,model))
     if old and (not provider or old[0]["status"] == "MODEL_OK"):
         return json.loads(old[0]["payload"])
     signal = payload["signal"]
     template = {"summary":f"指数状态：{label(signal['state_label']) if signal['state_label'] else '数据未通过'}；个人状态：{label(payload['decision']['action'] or payload['decision']['status'])}。", "evidence_refs":[],"limitations":["这是指数规则研究，不能承诺收益；指数表现不等于基金或账户收益","旧数据发布时间和历史修订无法完整重建"],"counterarguments":["趋势策略可能在震荡行情反复交易或错过反弹"],"scenarios":[]}
-    status,result = "TEMPLATE",template
-    lease,owner = None,uuid.uuid4().hex
+    reused = None
     if provider:
+        cached = store.rows("SELECT e.payload,e.created_at FROM explanations e JOIN personal_decisions d ON d.id=e.decision_id JOIN signal_runs s ON s.id=d.signal_id JOIN assignments a ON a.id=s.assignment_id WHERE e.input_hash=? AND e.model=? AND e.status='MODEL_OK' AND d.user_id=? AND a.code=? ORDER BY e.id DESC LIMIT 1",(input_hash,model,row['user_id'],row['code']))
+        if cached:
+            reused = json.loads(cached[0]['payload'])
+            reused['reuse'] = {'original_generated_at':reused.get('reuse',{}).get('original_generated_at',cached[0]['created_at'])}
+    status,result = ("MODEL_OK",reused) if reused is not None else ("TEMPLATE",template)
+    lease,owner = None,uuid.uuid4().hex
+    if provider and reused is None:
         lease = 'explanation:'+digest({'decision':decision_id,'input':input_hash,'model':model})
         instant = datetime.now(timezone.utc)
         with store.connect(True) as c:
@@ -74,7 +84,7 @@ def explain(store, decision_id, provider=None, model="TEMPLATE"):
                 raise ExplanationBusy('AI解读正在生成，请稍候，结果会自动保存')
             c.execute('INSERT INTO leases VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at',(lease,owner,(instant+timedelta(seconds=90)).isoformat()))
     try:
-        if provider:
+        if provider and reused is None:
             phase,started = 'provider',time.monotonic()
             try:
                 raw = provider(payload)

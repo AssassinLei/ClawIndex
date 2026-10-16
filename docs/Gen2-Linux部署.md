@@ -127,6 +127,31 @@ sudo bash deploy.sh update
 
 ## 7. 备份与恢复
 
+需要下载数据库时，无需进入`/var/lib/docker/`或修改Docker目录权限。在更新后的项目中执行：
+
+```bash
+cd ~/ClawIndex-Gen2
+sudo bash deploy.sh export-db
+```
+
+命令先用SQLite备份接口生成包含已提交WAL记录的一致性备份，再复制到项目目录，例如`~/ClawIndex-Gen2/clawindex-export-日期-进程号.db`。通过`sudo`执行时会把导出文件交还原登录账号，权限为600，可以直接用SFTP下载。服务无需停止；现有数据库和备份均不会被覆盖。
+
+还没更新到支持`export-db`的版本时，也可以执行：
+
+```bash
+cd ~/ClawIndex-Gen2 &&
+export_file="clawindex-export-$(date +%Y%m%d-%H%M%S).db" &&
+sudo docker compose --env-file .env.cloud exec -T worker \
+  python -m clawindex_next --db /data/quant_system_next.db \
+  backup --output "/backups/$export_file" &&
+sudo docker compose --env-file .env.cloud cp \
+  "worker:/backups/$export_file" "./$export_file" &&
+sudo chown "$(id -u):$(id -g)" "./$export_file" &&
+chmod 600 "./$export_file"
+```
+
+只需保存到备份卷时，原来的命令继续有效：
+
 ```bash
 sudo bash deploy.sh backup
 ```

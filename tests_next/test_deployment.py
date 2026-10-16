@@ -79,6 +79,7 @@ sudo() {
   shift 4
   "$@"
 }
+chown() { printf 'chown %s\\n' "$*" >> "$EVENTS"; }
 git() {
   printf 'git %s\\n' "$*" >> "$EVENTS"
   case "$1" in
@@ -94,6 +95,7 @@ docker() {
     *' ps -aq worker') printf 'test-worker\\n';;
     *'clawindex_next.deployment status') return "${DB_STATUS:-0}";;
     *' build worker') return "${BUILD_STATUS:-0}";;
+    *' cp worker:/backups/'*) [[ "${COPY_STATUS:-0}" == 0 ]] || return "$COPY_STATUS"; : > "${@: -1}";;
   esac
   return 0
 }
@@ -184,3 +186,21 @@ def test_git_index_read_failure_blocks_deploy_before_build_backup_or_fetch(host_
     assert result.returncode!=0
     assert 'build worker' not in events and 'ops backup' not in events
     assert 'git fetch' not in events and 'up -d' not in events
+
+
+def test_export_db_uses_consistent_backup_then_downloadable_private_file(host_cli):
+    run,path=host_cli
+    result,events=run('export-db',FAKE_UID='0',SUDO_UID='1234',SUDO_GID='5678')
+    assert result.returncode==0,result.stderr
+    assert events.index('ops backup --output /backups/clawindex-export-')<events.index(' cp worker:/backups/clawindex-export-')
+    files=list(path.glob('clawindex-export-*.db'))
+    assert len(files)==1 and files[0].name in result.stdout
+    assert 'chown -- 1234:5678 ' in events
+    assert 'git fetch' not in events and 'up -d' not in events and '/var/lib/docker' not in events
+
+
+def test_failed_export_copy_does_not_report_success(host_cli):
+    run,path=host_cli
+    result,events=run('export-db',COPY_STATUS='7')
+    assert result.returncode!=0 and '数据库已导出' not in result.stdout
+    assert not list(path.glob('clawindex-export-*.db'))

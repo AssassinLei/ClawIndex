@@ -36,6 +36,12 @@ def search(store, keyword='', limit=100):
     return rows[:limit]
 
 
+def refresh_due(store, instant):
+    state = store.rows('SELECT value FROM settings WHERE key=?',(KEY,))
+    state = json.loads(state[0]['value']) if state else {}
+    return not (state.get('format_version')==2 and state.get('next_check','')>instant.isoformat())
+
+
 def refresh(store, provider=None, instant=None):
     """Worker-maintained directory; preserve the last good copy on API failure."""
     instant = instant or datetime.now(timezone.utc)

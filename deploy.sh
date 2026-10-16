@@ -16,6 +16,7 @@ usage() {
   bash deploy.sh status          # 查看服务和数据库状态
   bash deploy.sh logs            # 查看最近日志
   bash deploy.sh backup          # 一致性备份到独立备份卷
+  bash deploy.sh export-db       # 一致性导出到项目目录，可直接用SFTP下载
   bash deploy.sh admin 账号名    # 空库首次部署后设置管理员；不会启用推送
   bash deploy.sh stop            # 手动停止后，不会在重启时自动恢复；用start恢复
 先安装Docker Engine + Compose插件，并填写.env.cloud。详见docs/Gen2-Linux部署.md。
@@ -24,7 +25,7 @@ HELP
 
 [[ ${1:-} != --help && ${1:-} != -h && $# -gt 0 ]] || { usage; exit 0; }
 ACTION="$1"; shift
-case "$ACTION" in install|update|start|status|logs|backup|stop|admin) ;; *) usage; exit 2;; esac
+case "$ACTION" in install|update|start|status|logs|backup|export-db|stop|admin) ;; *) usage; exit 2;; esac
 ACCOUNT=""
 if [[ "$ACTION" == admin ]]; then
   [[ $# -eq 1 && -n "$1" ]] || fail '请提供一个账号名，例如bash deploy.sh admin 我的账号'
@@ -86,6 +87,19 @@ permissions() {
   compose run --rm --no-deps --user root --entrypoint sh ops -c 'chown 10001:10001 /data /backups; for f in /data/quant_system_next.db /data/quant_system_next.db-wal /data/quant_system_next.db-shm; do if [ -e "$f" ]; then chown 10001:10001 "$f"; fi; done'
 }
 backup() { ops backup --output "/backups/gen2-$(date -u +%Y%m%dT%H%M%SZ)-$$.db"; }
+export_db() {
+  local filename destination
+  filename="clawindex-export-$(date -u +%Y%m%dT%H%M%SZ)-$$.db"
+  destination="$ROOT/$filename"
+  [[ ! -e "$destination" && ! -L "$destination" ]] || fail '目标已存在，不会覆盖'
+  ops backup --output "/backups/$filename"
+  compose cp "worker:/backups/$filename" "$destination"
+  chmod 600 "$destination"
+  if [[ "$(id -u)" == 0 && ${SUDO_UID:-0} =~ ^[0-9]+$ && ${SUDO_UID:-0} != 0 && ${SUDO_GID:-} =~ ^[0-9]+$ ]]; then
+    chown -- "${SUDO_UID}:${SUDO_GID}" "$destination"
+  fi
+  printf '%s\n' "数据库已导出，可用SFTP下载：$destination"
+}
 start() {
   if ! compose up -d --wait --wait-timeout 180 worker web; then
     compose ps -a
@@ -147,6 +161,7 @@ case "$ACTION" in
   status) running_image; compose ps -a; db_state;;
   logs) compose logs --tail=150 worker web;;
   backup) running_image; db_state; backup;;
+  export-db) running_image; db_state; export_db;;
   admin) running_image; db_state; ops create-user --admin -- "$ACCOUNT";;
   stop) compose stop worker web;;
 esac
