@@ -117,7 +117,7 @@ def put_rows(store, adapter, item, rows, instant, supplement=False):
     return changed
 
 
-def repair(adapter, store, item, instant, explicit_start=None):
+def repair(adapter, store, item, instant, explicit_start=None, force_repair=False):
     from .adapters import ProviderError
     code = item['code']
     expected = adapter.calendar.expected(item['calendar'],instant,grace_for(item))
@@ -127,7 +127,7 @@ def repair(adapter, store, item, instant, explicit_start=None):
     key = 'history_repair:'+code
     old = store.rows('SELECT value FROM settings WHERE key=?',(key,))
     state = json.loads(old[0]['value']) if old else {}
-    attempts = state.get('windows',{})
+    attempts = {} if force_repair else state.get('windows',{})
     stalls = state.get('stalled_windows',{})
     recent = max(first,(pd.Timestamp(expected)-pd.Timedelta(days=10 if records else 90)).date().isoformat())
     # Explicit dates are supported for operators, but the normal UI needs none.
@@ -135,7 +135,7 @@ def repair(adapter, store, item, instant, explicit_start=None):
     local_day = instant.astimezone(ZoneInfo('Asia/Hong_Kong')).date().isoformat()
     latest_valid = expected in records and valid_price(records[expected]) and records[expected].get('quality') != 'LEGACY_PROVENANCE_UNKNOWN'
     last_check = state.get('latest_checked_at')
-    latest_due = (not last_check or state.get('expected') != expected or
+    latest_due = (force_repair or not last_check or state.get('expected') != expected or
                   (not latest_valid and instant.isoformat() >= state.get('latest_retry_at','')) or
                   (latest_valid and state.get('latest_checked_day') != local_day))
     ranges = [(max(first,a),min(expected,b)) for a,b in windows([d for d in all_days if d>=recent],maximum=2)] if latest_due or explicit_start else []
@@ -145,7 +145,7 @@ def repair(adapter, store, item, instant, explicit_start=None):
     required = max([125]+[json.loads(r['spec'])['ma']+json.loads(r['spec'])['slope_window'] for r in specs])
     essential_days = set(all_days[-required:])
     essential_missing = [d for d in missing if d in essential_days]
-    essential_due = state.get('essential_expected') != expected or state.get('essential_retry_at','')<=instant.isoformat()
+    essential_due = force_repair or state.get('essential_expected') != expected or state.get('essential_retry_at','')<=instant.isoformat()
     ready = [d for d in missing if attempts.get(str(pd.Timestamp(d).to_period('Q')),'') <= instant.isoformat()]
     current_quarters = {str(pd.Timestamp(a).to_period('Q')) for a,b in ranges}
     ready = [d for d in ready if str(pd.Timestamp(d).to_period('Q')) not in current_quarters]
@@ -154,14 +154,18 @@ def repair(adapter, store, item, instant, explicit_start=None):
     ranges += [(max(first,a),min(expected,b)) for a,b in chosen if str(pd.Timestamp(a).to_period('Q')) not in current_quarters][:3]
     changed = 0
     used_fallback = False
+    requests = []
     for a,b in ranges:
         before = sum(a<=d<=b for d in missing)
         try:
             rows = adapter.fetch(item,a,b,instant)
-            changed += put_rows(store,adapter,item,rows,instant)
+            added = put_rows(store,adapter,item,rows,instant)
+            changed += added
+            requests.append({'start':a,'end':b,'returned':len(rows),'changed':added,'status':'RETURNED' if rows else 'EMPTY'})
         except ProviderError as exc:
             if str(exc).startswith('NO_PERMISSION'):
                 raise
+            requests.append({'start':a,'end':b,'returned':0,'changed':0,'status':'RETRY'})
             store.health('sync','RETRY',code+'：该段历史暂未获取，后台定期重试')
         current = latest_rows(store,code)
         after = sum(a<=d<=b and (d not in current or not valid_price(current[d]) or current[d].get('quality') == 'LEGACY_PROVENANCE_UNKNOWN') for d in all_days)
@@ -174,10 +178,13 @@ def repair(adapter, store, item, instant, explicit_start=None):
             start = max(a,(pd.Timestamp(end)-pd.Timedelta(days=31)).date().isoformat())
             try:
                 rows = adapter.fetch(item,start,end,instant)
-                changed += put_rows(store,adapter,item,rows,instant)
+                added = put_rows(store,adapter,item,rows,instant)
+                changed += added
+                requests.append({'start':start,'end':end,'returned':len(rows),'changed':added,'status':'RETURNED' if rows else 'EMPTY'})
             except ProviderError as exc:
                 if str(exc).startswith('NO_PERMISSION'):
                     raise
+                requests.append({'start':start,'end':end,'returned':0,'changed':0,'status':'RETRY'})
             current = latest_rows(store,code)
             after = sum(a<=d<=b and (d not in current or not valid_price(current[d]) or current[d].get('quality') == 'LEGACY_PROVENANCE_UNKNOWN') for d in all_days)
         # Revisit unfillable provider windows later; move on to the other quarters.
@@ -201,6 +208,9 @@ def repair(adapter, store, item, instant, explicit_start=None):
     details = {'checked_at':instant.isoformat(),'expected':expected,'start':first,'missing_sessions':len(remaining),
                'pending':bool(remaining),'next_due':next_due,'windows':attempts,'stalled_windows':stalls,
                'required_sessions':required,'essential_missing_sessions':len(essential_remaining),
+               'changed_sessions':changed,'manual_retry':bool(force_repair),
+               'requests':requests or state.get('requests',[]),
+               'requests_checked_at':instant.isoformat() if requests else state.get('requests_checked_at'),
                **{k:state[k] for k in ('latest_checked_at','latest_checked_day','latest_retry_at','essential_expected','essential_retry_at') if k in state}}
     with store.connect(True) as c:
         c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,canonical(details)))

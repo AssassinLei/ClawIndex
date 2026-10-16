@@ -47,7 +47,9 @@ class Worker:
 
     def enqueue_inspections(self, assignments, code, expected, instant):
         from .engine import ALGORITHM
-        revision = self.store.rows('SELECT MAX(id) n FROM observations WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)',(code,expected,instant.isoformat()))[0]['n']
+        from .decision_lifecycle import current_revision
+        with self.store.connect() as c:
+            revision = current_revision(c,code,expected,instant)
         for assignment in (a for a in assignments if a['code']==code):
             include_ai = inspection_ai_enabled(self.store, assignment['user_id'])
             context = [self.store.rows(f'SELECT MAX(id) n FROM {table} WHERE user_id=? AND code=?',(assignment['user_id'],code))[0]['n'] for table in ('position_reports','budgets','product_mappings')]
@@ -175,6 +177,11 @@ class Worker:
                 need_ai = bool(evaluated and request.get('include_ai') and not handled)
                 if not need_ai:
                     detail = '处理完成，请查看数据与解读'
+                    if request.get('force_repair'):
+                        repair = c.execute("SELECT r.value FROM settings r JOIN assignments a ON r.key='history_repair:'||a.code WHERE a.id=?",(job['assignment_id'],)).fetchone()
+                        if repair:
+                            state = json.loads(repair[0])
+                            detail = f"本轮补回或更新 {state.get('changed_sessions',0)} 条行情；历史仍有 {state.get('missing_sessions',0)} 个缺口，"+('后台将继续分批补齐' if state.get('pending') else '请查看最新判断')
                     if evaluated and request.get('include_ai'):
                         from .explanations import model_identity
                         ai = c.execute('SELECT status FROM explanations WHERE decision_id=? AND model=? ORDER BY id DESC LIMIT 1',(evaluated[1],model_identity())).fetchone()
@@ -226,7 +233,8 @@ class Worker:
             assignment = self.store.rows("SELECT code,user_id FROM assignments WHERE id=?", (job["assignment_id"],))[0]
             if request.get("refresh"):
                 progress(self.store,job["id"],self.owner,"syncing","正在更新到该市场最近已发布的交易日")
-                self.syncer.refresh(assignment["code"],start=request.get("start"))
+                options = {'force_repair':True} if request.get('force_repair') else {}
+                self.syncer.refresh(assignment["code"],start=request.get("start"),**options)
             evaluated = None
             if request.get('kind') == 'explanation':
                 owned = self.store.rows('SELECT d.id,s.id signal_id FROM personal_decisions d JOIN signal_runs s ON s.id=d.signal_id WHERE d.id=? AND d.user_id=? AND s.assignment_id=?',(request.get('decision_id'),assignment['user_id'],job['assignment_id']))

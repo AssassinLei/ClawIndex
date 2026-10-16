@@ -182,13 +182,13 @@ class TushareAdapter:
             item = store.rows('SELECT * FROM instruments WHERE code=?',(code,))[0]
         return item
 
-    def sync(self, store, code, start=None, instant=None):
+    def sync(self, store, code, start=None, instant=None, force_repair=False):
         instant = instant or datetime.now(timezone.utc)
         item = self.ensure_identity(store,code)
         if not json.loads(item["metadata"]).get("identity_verified"):
             raise ProviderError("UNSUPPORTED: 请先核实标的身份")
         from .data_maintenance import repair
-        return repair(self,store,item,instant,start)
+        return repair(self,store,item,instant,start,force_repair=force_repair)
 
     def sync_supplements(self, store, item, instant):
         from .data_maintenance import latest_rows, put_rows, windows

@@ -150,6 +150,8 @@ def run():
             st.caption("历史行情、基础指标与适用的专业因子均由后台自动维护，无需手动补数据。")
             if st.button("提交该指数巡检",type="primary"):
                 guarded(lambda:start_inspection(svc,[selected]))
+            from .ui_components import data_repair_controls
+            data_repair_controls(svc,selected,'watch_repair_'+selected['code'])
             with st.expander("标的资料与来源"):
                 st.json(json.loads(selected["metadata"]))
             with st.expander("后台数据维护进度"):

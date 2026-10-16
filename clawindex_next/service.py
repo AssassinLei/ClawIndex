@@ -290,14 +290,12 @@ class UserService:
         if row:
             decision,signal = json.loads(row['decision']),json.loads(row['signal'])
             refs = {name:self.store.rows(f'SELECT MAX(id) v FROM {table} WHERE user_id=? AND code=?',(self.user['id'],assignment['code']))[0]['v'] for table,name in (('position_reports','report'),('budgets','budget'),('product_mappings','mapping'))}
-            dataset_revision = self.store.rows("SELECT MAX(CAST(json_extract(value,'$.id') AS INTEGER)) v FROM datasets,json_each(datasets.manifest,'$.observations') WHERE datasets.id=?",(row['dataset_id'],))[0]['v']
             try:
                 item = self.store.rows('SELECT * FROM instruments WHERE code=?',(assignment['code'],))[0]
                 expected = MarketCalendar().expected(item['calendar'],instant,grace_for(item))
             except (ValueError,RuntimeError):
                 expected = None
-            revision = self.store.rows('SELECT MAX(id) v FROM observations WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)',(assignment['code'],expected or '',instant.isoformat()))[0]['v']
-            current = signal['data_status'] in ('OK','INSUFFICIENT_DATA') and row['as_of'] == expected and decision.get('context_refs') == refs and decision['expires_at'] > instant.isoformat() and revision == dataset_revision
+            current = signal['data_status'] in ('OK','INSUFFICIENT_DATA') and row['as_of'] == expected and decision.get('context_refs') == refs and decision['expires_at'] > instant.isoformat()
             if signal['data_status'] == 'INSUFFICIENT_DATA':
                 repair = self.store.rows('SELECT value FROM settings WHERE key=?',('history_repair:'+assignment['code'],))
                 state = json.loads(repair[0]['value']) if repair else {}
@@ -324,6 +322,13 @@ class UserService:
         # A queued automatic inspection can be upgraded rather than duplicated.
         jid = enqueue(self.store,assignment_id,refresh=not current,include_ai=include_ai)
         return {'status':'UPDATED' if today else 'QUEUED','job_id':jid,'decision_id':None,'message':'今天已巡检过，行情或持仓等输入发生变化，正在重新计算。' if today else '巡检请求已保存；相同的待执行任务会合并处理。'}
+
+    def request_data_repair(self, assignment_id, include_ai=None):
+        assignment = self._assignment(assignment_id)
+        if not assignment['active']:
+            raise ValueError('监控已归档')
+        include_ai = self.inspection_ai_enabled() if include_ai is None else bool(include_ai)
+        return enqueue(self.store,assignment_id,refresh=True,include_ai=include_ai,force_repair=True)
 
     def market_status(self, code):
         self._code(code)
@@ -642,10 +647,16 @@ class Evaluator:
             c.execute("INSERT OR IGNORE INTO personal_decisions VALUES(?,?,?,?,?,?)", (decision_id,signal_id,assignment["user_id"],context["report"]["id"] if context["report"] else None,canonical(decision),stamp))
             current_context = {name:c.execute(f"SELECT MAX(id) FROM {table} WHERE user_id=? AND code=?", (assignment["user_id"],assignment["code"])).fetchone()[0] for table,name in (("position_reports","report"),("budgets","budget"),("product_mappings","mapping"))}
             still_current = current_context == decision["context_refs"] and bool(c.execute("SELECT active FROM assignments WHERE id=?", (assignment_id,)).fetchone()[0])
-            revision = max(r["id"] for r in manifest["observations"])
-            if still_current:
-                c.execute("""INSERT INTO current_signals VALUES(?,?,?) ON CONFLICT(assignment_id) DO UPDATE SET signal_id=excluded.signal_id,as_of=excluded.as_of
-                    WHERE excluded.as_of>current_signals.as_of OR (excluded.as_of=current_signals.as_of AND ?>=(SELECT MAX(CAST(json_extract(value,'$.id') AS INTEGER)) FROM json_each((SELECT d.manifest FROM signal_runs s JOIN datasets d ON d.id=s.dataset_id WHERE s.id=current_signals.signal_id),'$.observations')))""", (assignment_id,signal_id,manifest["as_of"],revision))
+            from .decision_lifecycle import evidence_current, manifest_revision, observation_floor
+            previous = c.execute('SELECT v.as_of,d.manifest FROM current_signals v JOIN signal_runs s ON s.id=v.signal_id JOIN datasets d ON d.id=s.dataset_id WHERE v.assignment_id=?',(assignment_id,)).fetchone()
+            floor = observation_floor(c,assignment['code'])
+            revision = manifest_revision(manifest,floor)
+            previous_revision = manifest_revision(json.loads(previous['manifest']),floor) if previous else None
+            can_replace = not previous or manifest['as_of']>previous['as_of'] or (manifest['as_of']==previous['as_of'] and revision>=(previous_revision or 0))
+            # Both versions must be compared over the same analysis scope.
+            # Also reject a computation overtaken by a real data correction.
+            if still_current and can_replace and evidence_current(c,signal_id,assignment['code'],manifest['as_of'],instant):
+                c.execute('INSERT INTO current_signals VALUES(?,?,?) ON CONFLICT(assignment_id) DO UPDATE SET signal_id=excluded.signal_id,as_of=excluded.as_of',(assignment_id,signal_id,manifest['as_of']))
             projection = c.execute("SELECT signal_id FROM current_signals WHERE assignment_id=?", (assignment_id,)).fetchone()
             if still_current and projection and projection[0] == signal_id and assignment["stage"] == "ENABLED" and decision["status"] == "AVAILABLE" and decision["action"] in ("BUY","SELL","HOLD","WAIT"):
                 from .decision_lifecycle import feedback, HANDLED

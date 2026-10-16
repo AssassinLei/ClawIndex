@@ -10,12 +10,14 @@ from .presentation import label, local_time, number, readable
 from .worker import worker_status
 
 
-def start_inspection(svc, watches, include_ai=None, kind="inspection", start=None):
+def start_inspection(svc, watches, include_ai=None, kind="inspection", start=None, force_repair=False):
     include_ai = svc.inspection_ai_enabled() if include_ai is None else include_ai
     ids = []
     skipped,ai_only,changed = 0,0,0
     for watch in watches:
-        if kind == 'inspection' and not start:
+        if force_repair:
+            ids.append(svc.request_data_repair(watch['id'],include_ai))
+        elif kind == 'inspection' and not start:
             request = svc.request_inspection(watch['id'],include_ai)
             skipped += request['status'] == 'ALREADY_DONE'
             ai_only += request['status'] == 'AI_ONLY'
@@ -33,6 +35,32 @@ def start_inspection(svc, watches, include_ai=None, kind="inspection", start=Non
         st.session_state.loading_jobs = ids
     elif not watches:
         st.info("还没有监控指数，请先到“监控与数据”添加。")
+
+
+def data_repair_controls(svc, watch, key):
+    records = svc.store.rows('SELECT value FROM settings WHERE key=?',('history_repair:'+watch['code'],))
+    if records:
+        state = json.loads(records[0]['value'])
+        missing = state.get('missing_sessions',0)
+        essential = state.get('essential_missing_sessions')
+        st.caption(f'历史待补齐：{missing} 个交易日'+(f'；当前规则关键窗口缺 {essential} 个交易日' if essential is not None else ''))
+        if 'changed_sessions' in state:
+            st.caption(f"上次检查补回或更新 {state['changed_sessions']} 条行情 · "+local_time(state.get('checked_at')))
+        if state.get('requests'):
+            with st.expander('最近补齐请求明细'):
+                st.caption('请求时间：'+local_time(state.get('requests_checked_at')))
+                st.dataframe(pd.DataFrame([{'开始日期':r['start'],'结束日期':r['end'],'接口返回条数':r['returned'],
+                                            '补回或更新':r['changed'],'接口状态':{'RETURNED':'已返回数据','EMPTY':'本次返回为空','RETRY':'请求失败，稍后重试'}.get(r['status'],'待核实')}
+                                           for r in state['requests']]),hide_index=True,width='stretch')
+    if st.button('立即补齐缺口',key=key,help='立即重试缺失历史并重新巡检，不删除已有记录；未完成部分由后台分批继续。'):
+        try:
+            start_inspection(svc,[watch],force_repair=True)
+            st.info('补齐请求已提交；本次会重新请求缺口，完成后更新判断。相同待执行请求会合并。')
+            # The data card is a fragment; refresh the parent once so the saved
+            # request opens the same durable progress dialog as other tasks.
+            st.rerun()
+        except (ValueError,PermissionError,RuntimeError) as exc:
+            st.error(str(exc))
 
 
 def dismiss_loading():
@@ -279,6 +307,9 @@ def today_details(svc, row, signal):
     if st.session_state.get(selection) == 'data':
         st.caption('行情截至 '+row['as_of'])
         evidence_panel(svc.store,signal,expanded=True)
+        watch = next((w for w in svc.watchlist() if w['code']==row['code']),None)
+        if watch:
+            data_repair_controls(svc,watch,'today_repair_'+row['code'])
     elif st.session_state.get(selection) == 'ai':
         explanation_panel(record)
         ai_action(svc,row['decision_id'],'today_generate_',refresh=False)

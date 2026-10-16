@@ -32,7 +32,7 @@ class MarketSync:
                 item = self.provider.ensure_identity(self.store,code)
         return item
 
-    def refresh(self, code, start=None, instant=None, reuse_seconds=300):
+    def refresh(self, code, start=None, instant=None, reuse_seconds=300, force_repair=False):
         instant = instant or datetime.now(timezone.utc)
         item = self.ensure_identity(code)
         expected = self.calendar.expected(item["calendar"],instant,grace_for(item))
@@ -45,7 +45,7 @@ class MarketSync:
             repair_due = json.loads(repair[0]) if repair else {}
             latest = c.execute("SELECT MAX(trade_date) FROM observations WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)", (code,expected,instant.isoformat())).fetchone()[0]
             repair_ready = bool(repair_due.get('pending') or repair_due.get('missing_sessions',0)>0) and repair_due.get('next_due','') <= instant.isoformat()
-            if not start and not repair_ready and saved.get("expected") == expected and saved.get("status") == "OK" and latest and latest >= expected and instant-datetime.fromisoformat(saved["checked_at"]) < timedelta(seconds=reuse_seconds):
+            if not force_repair and not start and not repair_ready and saved.get("expected") == expected and saved.get("status") == "OK" and latest and latest >= expected and instant-datetime.fromisoformat(saved["checked_at"]) < timedelta(seconds=reuse_seconds):
                 return "已复用刚更新的共享行情"
             lease = c.execute("SELECT * FROM leases WHERE name=?", (key,)).fetchone()
             if lease and lease["expires_at"] > now():
@@ -64,7 +64,8 @@ class MarketSync:
         try:
             if self.provider is None:
                 self.provider = TushareAdapter(rate_limiter=lambda:rate_limit(self.store))
-            self.provider.sync(self.store,code,start=start,instant=instant)
+            options = {'force_repair':True} if force_repair else {}
+            self.provider.sync(self.store,code,start=start,instant=instant,**options)
             latest = self.store.rows("SELECT MAX(trade_date) d FROM observations WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)", (code,expected,instant.isoformat()))[0]["d"]
             if not latest or latest < expected:
                 raise ProviderError("DELAYED: 预期交易日的数据尚未发布，请稍后重试")

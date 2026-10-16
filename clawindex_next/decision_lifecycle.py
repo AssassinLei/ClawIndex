@@ -7,13 +7,32 @@ from .engine import ALGORITHM
 HANDLED = {'SUBMITTED','EXECUTED','PARTIAL','DEFERRED','CANCELLED','EXPIRED'}
 
 
+def observation_floor(c, code):
+    if code != 'HKTECH':
+        return ''
+    from .data_maintenance import history_start
+    item = c.execute('SELECT code,metadata FROM instruments WHERE code=?',(code,)).fetchone()
+    return history_start(item)
+
+
+def current_revision(c, code, day, instant):
+    return c.execute('SELECT MAX(id) FROM observations WHERE code=? AND trade_date>=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)',
+                     (code,observation_floor(c,code),day,instant.isoformat())).fetchone()[0]
+
+
+def manifest_revision(manifest, floor=''):
+    # Data and observation refs are aligned in every saved evaluator manifest.
+    # Scope legacy snapshots before comparing their monotonic revision IDs.
+    return max((o['id'] for row,o in zip(manifest['data'],manifest['observations']) if row['date']>=floor),default=None)
+
+
 def evidence_current(c, signal_id, code, day, instant):
     row = c.execute("SELECT d.manifest,f.algorithm FROM signal_runs s JOIN datasets d ON d.id=s.dataset_id JOIN feature_snapshots f ON f.id=s.feature_id WHERE s.id=?",(signal_id,)).fetchone()
     if not row or row['algorithm']!=ALGORITHM:
         return False
     manifest = json.loads(row['manifest'])
-    frozen = max((r['id'] for r in manifest['observations']),default=None)
-    revision = c.execute("SELECT MAX(id) FROM observations WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?)",(code,day,instant.isoformat())).fetchone()[0]
+    frozen = manifest_revision(manifest,observation_floor(c,code))
+    revision = current_revision(c,code,day,instant)
     return frozen is not None and frozen==revision
 
 

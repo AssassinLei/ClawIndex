@@ -24,10 +24,12 @@ def reconcile(store, user_id=None, instant=None):
         c.execute(f"UPDATE jobs SET status='FAILED',error='已达到3次尝试上限，任务已结束',claim_until=NULL,updated_at=? WHERE {scope} AND attempts>=3 AND (status IN ('PENDING','RETRY') OR (status='RUNNING' AND COALESCE(claim_until,'')<=?))",(stamp,user_id,user_id,stamp))
 
 
-def enqueue(store, assignment_id, refresh=True, include_ai=False, kind="inspection", start=None, decision_id=None):
+def enqueue(store, assignment_id, refresh=True, include_ai=False, kind="inspection", start=None, decision_id=None, force_repair=False):
     request = {"refresh":bool(refresh), "include_ai":bool(include_ai), "kind":kind, "start":start}
     if decision_id:
         request['decision_id'] = decision_id
+    if force_repair:
+        request['force_repair'] = True
     with store.connect(True) as c:
         # Repeated clicks and different tabs reuse the same active request.
         rows = c.execute("SELECT j.id,j.status,s.value FROM jobs j LEFT JOIN settings s ON s.key='request:'||j.id WHERE j.assignment_id=? AND j.status IN ('PENDING','RUNNING','RETRY') ORDER BY j.created_at", (assignment_id,)).fetchall()
@@ -41,10 +43,12 @@ def enqueue(store, assignment_id, refresh=True, include_ai=False, kind="inspecti
             # running job can accept AI until its atomic completion check, but
             # cannot be told to repeat a sync phase it has already passed.
             can_merge = same_kind and same_target and (row['status'] != 'RUNNING' or
-                        ((not refresh or old.get('refresh')) and (not start or old.get('start') and old['start']<=start)))
+                        ((not refresh or old.get('refresh')) and (not start or old.get('start') and old['start']<=start) and (not force_repair or old.get('force_repair'))))
             if can_merge:
                 merged = {**old,**request,'refresh':bool(old.get('refresh') or refresh),'include_ai':bool(old.get('include_ai') or include_ai),
                           'start':min(x for x in (old.get('start'),start) if x) if old.get('start') or start else None}
+                if old.get('force_repair') or force_repair:
+                    merged['force_repair'] = True
                 c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",('request:'+row['id'],canonical(merged)))
                 return row['id']
         jid, stamp = uuid.uuid4().hex, now()
