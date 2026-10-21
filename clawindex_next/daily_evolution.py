@@ -38,7 +38,7 @@ def request(evolution, policy_id, instant=None):
         if not authorized(base,payload['anchor_spec'],payload['config']):
             raise ValueError('现行规则超出研究范围，请先保存新的进化设置')
         rid = digest({'mode':MODE,'user':policy['user_id'],'code':policy['code'],'day':day})
-        config = {'mode':MODE,'requested_day':day,'requested_at':stamp(instant),'policy':payload['config'],
+        config = {'mode':MODE,'trigger':'MANUAL_DAILY','requested_day':day,'requested_at':stamp(instant),'policy':payload['config'],
                   'base_spec':base,'plan':[],'historical_only':True,'repeated_history':True,
                   'waiting_reason':'后台正在准备行情，缺口自动补齐后继续。'}
         c.execute("INSERT INTO evolution_runs(id,policy_id,assignment_id,status,manifest,payload,created_at,updated_at) VALUES(?,?,?,'WAITING_DATA','{}',?,?,?)",

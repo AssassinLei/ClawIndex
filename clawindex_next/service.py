@@ -544,7 +544,7 @@ class UserService:
         if not policy:
             raise ValueError("请先保存自动进化配置")
         from .evolution import Evolution
-        return Evolution(self.store,Evaluator(self.store)).request(policy["id"])
+        return Evolution(self.store,Evaluator(self.store)).request(policy["id"],trigger='MANUAL_RESEARCH')
 
     def evolve_daily(self, code):
         self._code(code)
@@ -567,6 +567,11 @@ class UserService:
             for key in ("payload","candidate_payload","candidate_state"):
                 row[key] = json.loads(row[key]) if row[key] else None
         return rows
+
+    def evolution_records(self, code):
+        self._code(code)
+        from .evolution_records import records
+        return records(self.store,self.user['id'],code) if self.store.version>=2 else []
 
     def confirm_execution(self, decision_id, outcome, note="", position=None, fields=None):
         from .execution import confirm

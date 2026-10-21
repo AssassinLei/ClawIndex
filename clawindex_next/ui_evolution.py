@@ -1,6 +1,7 @@
 """Chinese, concise operation and evolution panels; details stay expandable."""
 import json
 from datetime import datetime,timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -59,6 +60,39 @@ def rollback_action(svc, history):
             st.error(str(exc))
         else:
             st.rerun()
+
+
+@st.fragment(run_every='5s')
+def evolution_records_panel(svc, code):
+    st.subheader('进化记录')
+    st.caption('区分研究发起时间与参数真正生效时间；所有时间为北京时间，最多显示最近250条。')
+    records = svc.evolution_records(code)
+    if not records:
+        st.info('还没有进化记录。手动进化、后台研究及实际参数更新后，会在这里留存。')
+        return
+    def time_text(value):
+        return datetime.fromisoformat(value).astimezone(ZoneInfo('Asia/Hong_Kong')).strftime('%Y-%m-%d %H:%M:%S') if value else '尚未生效'
+    scope = st.selectbox('记录类型',['全部记录','手动发起','自动发起','历史来源未记录'],key='evolution_record_scope_'+code)
+    applied_only = st.checkbox('仅看实际参数变更与回退',key='evolution_record_applied_'+code)
+    shown = [r for r in records if (not applied_only or r['applied']) and
+             (scope=='全部记录' or scope=='手动发起' and r['source'].startswith('MANUAL_') or
+              scope=='自动发起' and r['source']=='AUTOMATIC' or scope=='历史来源未记录' and r['source']=='LEGACY')]
+    if not shown:
+        st.info('当前筛选下没有记录。未通过研究不会被记作参数已调整。')
+        return
+    st.dataframe(pd.DataFrame([{'发起时间':time_text(r['requested_at']),'生效时间':time_text(r['applied_at']),
+                               '发起方式':r['source_label'],'结果':r['outcome'],
+                               '实际参数变化':'；'.join(f"{d['parameter']}：{d['before']} → {d['after']}" for d in r['changes']) or '现行参数未调整'} for r in shown]),hide_index=True,width='stretch')
+    by_id = {r['id']:r for r in shown}
+    with st.expander('查看某次进化的参数与依据',key='evolution_record_detail_'+code,on_change='rerun'):
+        rid = st.selectbox('选择进化记录',list(by_id),format_func=lambda key:time_text(by_id[key]['event_at'])+' · '+by_id[key]['source_label']+' · '+by_id[key]['outcome'],key='evolution_record_id_'+code)
+        record = by_id[rid]
+        st.write('结果：'+record['outcome']+'；'+record['application'])
+        st.write('依据：'+record['reason'])
+        for title,items in (('实际生效的参数变化',record['changes']),('候选参数变化（尚未生效）',record['candidate_changes'])):
+            if items:
+                st.markdown('**'+title+'**')
+                st.dataframe(pd.DataFrame([{'参数':d['parameter'],'调整前':d['before'],'调整后':d['after']} for d in items]),hide_index=True,width='stretch')
 
 
 @st.fragment(run_every="5s")
@@ -149,6 +183,7 @@ def evolution_panel(svc, selected, guarded):
     if notice and notice['code']==selected['code']:
         st.success(st.session_state.pop('evolution_notice')['message'])
     evolution_progress(svc,selected['code'])
+    evolution_records_panel(svc,selected['code'])
     st.caption('以下开关属于长期自动进化；上方主动提交的每日进化任务单独运行。')
     cols = st.columns(3)
     cols[0].metric("自动研究", ("已开启" if config["enabled"] else "已暂停") if saved else "待初始化")

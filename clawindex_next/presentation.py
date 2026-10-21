@@ -5,6 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 LABELS = {
+    'volatility60':'近60日年化波动','max_drawdown120':'近120日期间最大收盘回撤',
     'radar':'机会雷达','radar_notification':'机会提醒','relative60':'60日相对沪深300表现','relative120':'120日相对沪深300表现','return120':'近120日表现','extension20':'高于20日均线幅度','ma20':'20日均线','ma60_slope':'60日均线变化','above':'连续高于规则均线天数','pe_samples':'市盈率有效样本','pb_samples':'市净率有效样本',
     'WAITING_DATA':'等待后台准备行情','READY_TO_APPLY':'等待应用新规则','catalog':'指数搜索目录',
     "SUBMITTED":"已下单，等待成交确认", "FROZEN":"历史研究完成", "FORWARD_SHADOW":"新行情模拟观察",

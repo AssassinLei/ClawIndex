@@ -32,7 +32,7 @@ def radar_panel(svc, guarded):
     if state is None:
         return
     st.write('自动寻找你尚未关注的行业方向。**只扫描申万一级、二级指数，最多展示3个候选，允许没有机会。**')
-    st.caption('程序按固定首版规则筛选；尚无长期前向验证。候选不是买入指令，加入监控后由“今日操作”继续判断。')
+    st.caption('程序按固定研究规则筛选；尚无长期前向验证。候选不是买入指令，加入监控后由“今日操作”继续判断。')
     notice = st.session_state.pop('radar_notice',None)
     if notice:
         (st.success if notice['ok'] else st.error)(notice['message'])
@@ -60,6 +60,8 @@ def radar_panel(svc, guarded):
                    ('历史已准备',f"{report['available']}/{report['total']}",'共同价格与比较基准'),
                    ('市场观察',{'UP':'向上','CAUTIOUS':'谨慎','UNKNOWN':'准备中'}[report['market']['status']],'描述当前条件，不预测牛熊')],aria_label='机会筛选概览')
     st.caption('行情截至 '+report['as_of']+' · 扫描生成 '+local_time(report['created_at'])+' · 当前范围：申万 L1 + L2')
+    if report['market'].get('breadth_basis')=='L1':
+        st.caption(f"市场广度只统计一级行业，避免父子行业重复计票：已覆盖 {report['market']['breadth_available']}/{report['market']['breadth_total']} 个，近60日上涨占比 {report['market']['breadth']:.0%}。")
     if state['stale']:
         st.warning('这是上次扫描的证据，当前候选暂不展示。后台更新至已发布行情后自动替换。')
     elif report['status']!='COMPLETE':
@@ -85,22 +87,23 @@ def radar_panel(svc, guarded):
             cols = st.columns(3)
             cols[0].metric('近60日表现',number(row['features']['return60'],True))
             cols[1].metric('相对沪深300',number(row['features']['relative60'],True))
-            cols[2].metric('近120日回撤',number(row['features']['drawdown120'],True))
+            cols[2].metric('近120日最大收盘回撤' if 'max_drawdown120' in row['features'] else '距120日高点跌幅',number(row['features'].get('max_drawdown120',row['features'].get('drawdown120')),True))
             with st.expander('风险与失效条件',key='radar_risk_'+row['code'],on_change='rerun'):
                 for text in row['risks']+row['invalidations']:
                     st.write('• '+text)
                 st.caption('加入监控会跟随当前有效条件，以研究观察阶段开始；持仓、预算和正式推送权限由现有流程管理。')
             with st.container(horizontal=True):
                 st.button('加入我的指数',key='radar_add_'+row['code'],type='primary',on_click=act,args=(svc,'watch',row['code']))
-                st.button('暂不关注',key='radar_ignore_'+row['code'],on_click=act,args=(svc,'ignore',row['code']))
+                st.button('暂不关注',key='radar_ignore_'+row['code'],help='持续隐藏这个指数代码及其机会推送，直到在“我的隐藏列表”恢复；不改变筛选规则，也不连带隐藏父级或其他子行业。',on_click=act,args=(svc,'ignore',row['code']))
             with st.expander('查看数据依据',key='radar_evidence_'+row['code'],on_change='rerun'):
                 st.caption('相对表现是同一交易日窗口的价格收益比，不是胜率。估值只与自身可用历史比较。')
-                st.dataframe(pd.DataFrame([{'指标':label(k),'数值':number(v,k in ('return20','return60','return120','relative60','relative120','volatility20','drawdown120','extension20','pe_percentile','pb_percentile'))} for k,v in row['features'].items() if v is not None]),hide_index=True,width='stretch')
+                st.dataframe(pd.DataFrame([{'指标':'距120日高点跌幅' if k=='drawdown120' else label(k),'数值':number(v,k in ('return20','return60','return120','relative60','relative120','volatility20','volatility60','drawdown120','max_drawdown120','extension20','pe_percentile','pb_percentile'))} for k,v in row['features'].items() if v is not None]),hide_index=True,width='stretch')
                 st.caption('规则版本：'+report['rule']['version']+' · 证据版本：'+report['id'][:12])
                 st.json(report['sources'].get(row['code'],{}))
     if state['suppressed']:
         st.caption(f"另有 {len(state['suppressed'])} 个候选因行业重叠或走势同向等原因未重复展示。")
     with st.expander('我的隐藏列表'):
+        st.caption('隐藏持续生效，只影响本账号的该指数候选与机会推送，不作为策略训练反馈。只是不准备本次买入时，可以保留候选，无需隐藏。')
         names = {r['code']:r['name'] for r in report['rows']}
         for code in state['preferences']['ignored']:
             with st.container(horizontal=True):
@@ -123,13 +126,16 @@ def radar_panel(svc, guarded):
         st.write('先检查数据、波动、回撤、追涨幅度及可用估值，再按入场确认、趋势类型与中期相对表现排序；不按涨幅强行凑满名额。')
         for text in report['limitations']:
             st.caption(text)
-        st.caption('首版使用价格、估值与少量独立风险指标；专业因子可在加入监控后参与现有策略研究。没有成分股盈利质量和实际基金成交验证。')
-    with st.expander('机会后来怎样：20、60个交易日跟踪'):
+        st.caption('市场广度只统计一级行业；父子行业及同一一级行业下的候选不重复展示。风险同时检查20日、60日波动及120日期间最大收盘回撤；专业因子可在加入监控后参与策略研究。')
+    with st.expander('机会后来怎样：20、60个交易日跟踪',key='radar_tracking_'+str(svc.user['id']),on_change='rerun'):
         st.caption('共享候选首次展示后留证，包含后续下跌与撤销案例。用实际展示时间之后的下一次开盘作为比较起点，模拟双边各10基点成本；不是买入指令或真实账户收益。样本可能重叠，不计算赚钱概率。')
-        if st.button('查看展示后的跟踪结果',key='radar_outcomes'):
+        show_key = 'radar_show_outcomes_'+str(svc.user['id'])
+        if st.button('收起跟踪结果' if st.session_state.get(show_key) else '查看展示后的跟踪结果',key='radar_outcomes'):
+            st.session_state[show_key] = not st.session_state.get(show_key,False)
+        if st.session_state.get(show_key):
             records = guarded(svc.radar_outcomes)
             if records:
-                st.dataframe(pd.DataFrame([{'指数':r['name'],'首次展示':local_time(r['created_at']),'起算日期':r['entry_date'],
+                st.dataframe(pd.DataFrame([{'指数':r['name'],'筛选版本':r.get('rule_version','历史版本'),'首次状态':STATES.get(r.get('state'),'历史记录'),'首次展示':local_time(r['created_at']),'起算日期':r['entry_date'],
                                           '观察交易日':r['horizon'],'进度':{'MATURED':'观察完成','WAITING':'尚未到期','DATA_WAIT':'行情自动补充中'}[r['status']],
                                           '模拟净表现':number(r['return'],True),'同期沪深300':number(r['benchmark_return'],True),
                                           '相对表现':number(r['relative_return'],True),'期间最大收盘回撤':number(r['max_drawdown'],True)} for r in records]),hide_index=True,width='stretch')

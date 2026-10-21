@@ -13,12 +13,19 @@ def outcomes(store, calendar, instant=None, limit=200):
     end = expected(calendar,instant)
     records = [json.loads(r['value']) for r in store.rows("SELECT value FROM settings WHERE key LIKE 'radar:discovery:%' ORDER BY json_extract(value,'$.created_at') DESC,key LIMIT ?",(min(max(int(limit),1),500),))]
     result,cache = [],{}
+    versions = {}
     def prices(code):
         if code not in cache:
             rows = store.rows('SELECT o.* FROM observations o WHERE code=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?) AND id=(SELECT MAX(id) FROM observations WHERE code=o.code AND trade_date=o.trade_date AND (available_at IS NULL OR available_at<=?)) ORDER BY trade_date',(code,end,instant.isoformat(),instant.isoformat()))
             cache[code] = {r['trade_date']:json.loads(r['payload']) for r in rows}
         return cache[code]
     for record in records:
+        if not record.get('rule_version'):
+            report_id = record.get('report_id')
+            if report_id not in versions:
+                snapshot = store.rows('SELECT value FROM settings WHERE key=?',('radar:snapshot:'+str(report_id),))
+                versions[report_id] = json.loads(snapshot[0]['value']).get('rule',{}).get('version','历史版本') if snapshot else '历史版本'
+            record = {**record,'rule_version':versions[report_id]}
         # Distinct discovery episodes on one date keep their actual publication times.
         published = datetime.fromisoformat(record['created_at'])
         days = calendar.sessions('XSHG',record['as_of'],end)

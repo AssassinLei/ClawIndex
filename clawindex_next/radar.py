@@ -124,10 +124,13 @@ def publish(store, report, instant):
         c.execute('INSERT INTO settings VALUES(?,?)',('radar:snapshot:'+rid,canonical(saved)))
         c.execute("INSERT INTO settings VALUES('radar:latest',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(canonical(rid),))
         if report['status']=='COMPLETE':
-            for code in set(report['selected'])-set(previous['selected'] if previous else []):
+            # A new rule is a distinct forward cohort, even for an unchanged
+            # selected index. Never rewrite the old rule's discovery evidence.
+            prior_selected = previous['selected'] if previous and previous['rule_id']==report['rule_id'] else []
+            for code in set(report['selected'])-set(prior_selected):
                 row = next(r for r in report['rows'] if r['code']==code)
                 discovery = {'code':code,'name':row['name'],'as_of':report['as_of'],'created_at':instant.isoformat(),
-                             'state':row['state'],'kind':row['kind'],'report_id':rid,'rule_id':RULE_ID}
+                             'state':row['state'],'kind':row['kind'],'report_id':rid,'rule_id':report['rule_id'],'rule_version':report['rule']['version']}
                 c.execute('INSERT OR IGNORE INTO settings VALUES(?,?)',('radar:discovery:'+digest({'report':rid,'code':code}),canonical(discovery)))
             c.execute("INSERT INTO settings VALUES('radar:last_complete',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(canonical(rid),))
             c.execute("DELETE FROM settings WHERE key='radar:requested' AND json_extract(value,'$.as_of')<=?",(report['as_of'],))

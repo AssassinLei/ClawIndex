@@ -104,7 +104,7 @@ def test_fixed_rules_find_absolute_and_relative_trend_without_probability(radar_
     assert any(r['state']=='READY' for r in report['rows'])
     assert 0<len(report['selected'])<=3
     assert not {'801010.SI','801011.SI'} <= set(report['selected'])
-    assert report['rule']['version']=='opportunity_radar_v1'
+    assert report['rule']['version']=='opportunity_radar_v2'
     assert 'probability' not in canonical(report)
 
 

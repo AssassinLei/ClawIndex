@@ -121,7 +121,7 @@ class Evolution:
             result['factor_diagnostics'] = diagnostics(frame,manifest['sessions'][common])
         return manifest,result
 
-    def request(self, policy_id, instant=None):
+    def request(self, policy_id, instant=None, trigger='AUTOMATIC'):
         require_v2(self.store)
         instant = instant or datetime.now(timezone.utc)
         policies = self.store.rows("SELECT * FROM evolution_policies WHERE id=? AND active=1", (policy_id,))
@@ -140,6 +140,9 @@ class Evolution:
             raise ValueError("监控已停止")
         assignment = assignment[0]
         manifest,run_payload = self.plan(assignment,payload,instant)
+        if trigger not in ('AUTOMATIC','MANUAL_RESEARCH'):
+            raise ValueError('研究触发方式不正确')
+        run_payload['trigger'] = trigger
         plan = run_payload['plan']
         rid = digest({"policy":policy_id,"assignment":assignment["id"],"cycle":instant.date().isoformat(),"dataset":digest(manifest)})
         with self.store.connect(True) as c:
