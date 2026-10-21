@@ -148,6 +148,8 @@ def run():
             cols[1].metric("当前市场",label(selected['market']))
             cols[2].metric("持仓状态",label(svc.position(selected['code'])['status']))
             st.caption("历史行情、基础指标与适用的专业因子均由后台自动维护，无需手动补数据。")
+            from .ui_trends import trend_expander
+            trend_expander(svc,selected['code'],'watch')
             if st.button("提交该指数巡检",type="primary"):
                 guarded(lambda:start_inspection(svc,[selected]))
             from .ui_components import data_repair_controls
@@ -263,6 +265,12 @@ def run():
             empty_state("还没有操作记录", "首次巡检完成后，判断会自动保存在这里。")
         st.dataframe(pd.DataFrame([{"行情日期":r["as_of"],"指数":names.get(r["code"],r["code"]),"指数状态":label(json.loads(r["signal"])["state_label"]),"个人判断":label(json.loads(r["decision"])["action"] or json.loads(r["decision"])["status"])} for r in history]),hide_index=True,width="stretch")
         if history:
+            with st.expander('查看某次巡检的历史曲线',key='history_curves',on_change='rerun') as curves:
+                if curves.open:
+                    from .ui_trends import trend_panel
+                    signals = {r['signal_id']:r for r in history}
+                    signal_id = st.selectbox('选择巡检记录',list(signals),format_func=lambda sid:f"{signals[sid]['as_of']} · {names.get(signals[sid]['code'],signals[sid]['code'])} · {sid[:8]}",key='history_chart_signal')
+                    trend_panel(svc,signals[signal_id]['code'],'history',signal_id)
             st.header("补记处理结果")
             record = st.selectbox("反馈对应记录",history,format_func=lambda r:f"{r['as_of']} {r['code']} {label(json.loads(r['decision'])['action'] or json.loads(r['decision'])['status'])}")
             status = st.selectbox("执行反馈状态",["ACKNOWLEDGED","EXECUTED","PARTIAL","DEFERRED","EXPIRED","CANCELLED"],format_func=label)

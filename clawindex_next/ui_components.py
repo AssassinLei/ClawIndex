@@ -148,7 +148,7 @@ def explanation_panel(record):
     st.caption("生成时间："+local_time(record["created_at"])+"。买卖判断与参考金额由程序规则产生，AI仅负责解释。")
 
 
-def evidence_panel(db, signal, expanded=False):
+def evidence_panel(db, signal, expanded=False, svc=None, signal_id=None, chart_key='evidence'):
     with st.expander("查看数据与判断依据",expanded=expanded):
         st.caption("来源：行情与指标数据，以及程序规则计算的判断依据；此处不是AI生成的解读。")
         st.write("数据状态："+label(signal["data_status"]))
@@ -185,6 +185,9 @@ def evidence_panel(db, signal, expanded=False):
         for trace in signal["rule_trace"]:
             st.write("• "+readable(trace))
         st.caption("市场特征描述已发生的行情，不预测牛熊。估值不会临时取消退出条件。")
+        if svc and signal_id:
+            from .ui_trends import trend_expander
+            trend_expander(svc,signal['code'],chart_key,signal_id)
         with st.expander("技术版本详情（供排查和复核）"):
             st.json({"数据版本":signal["dataset_id"],"规则版本":signal["strategy_id"],"模型持仓状态":label(signal["model_state"])})
 
@@ -232,7 +235,7 @@ def signal_dashboard(svc):
                 st.warning("需要先处理："+label(decision["status"]))
             for text in decision["reasons"]+decision["required_context"]:
                 st.write("• "+readable(text))
-            evidence_panel(svc.store,signal)
+            evidence_panel(svc.store,signal,svc=svc,signal_id=row['signal_id'],chart_key='signals')
             record = svc.saved_explanation(row['decision_id'])
             with st.expander(explanation_title(record)):
                 explanation_panel(record)
@@ -300,16 +303,21 @@ def today_details(svc, row, signal):
     with st.container(horizontal=True):
         if st.button('查看数据',key='today_data_'+row['decision_id']):
             st.session_state[selection] = 'data'
+        if st.button('查看曲线',key='today_chart_'+row['decision_id']):
+            st.session_state[selection] = 'chart'
         if st.button('查看解读',key='today_ai_'+row['decision_id'],help='可能是AI解读或程序解读，具体来源以内容开头的标识为准。'):
             st.session_state[selection] = 'ai'
         if st.session_state.get(selection) and st.button('收起详情',key='today_close_'+row['decision_id']):
             st.session_state.pop(selection,None)
     if st.session_state.get(selection) == 'data':
         st.caption('行情截至 '+row['as_of'])
-        evidence_panel(svc.store,signal,expanded=True)
+        evidence_panel(svc.store,signal,expanded=True,svc=svc,signal_id=row['signal_id'],chart_key='today_evidence')
         watch = next((w for w in svc.watchlist() if w['code']==row['code']),None)
         if watch:
             data_repair_controls(svc,watch,'today_repair_'+row['code'])
+    elif st.session_state.get(selection) == 'chart':
+        from .ui_trends import trend_panel
+        trend_panel(svc,row['code'],'today',row['signal_id'])
     elif st.session_state.get(selection) == 'ai':
         explanation_panel(record)
         ai_action(svc,row['decision_id'],'today_generate_',refresh=False)

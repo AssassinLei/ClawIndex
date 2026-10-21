@@ -341,6 +341,31 @@ class UserService:
     def results(self):
         return self.store.rows("SELECT a.code,i.name,s.id signal_id,s.as_of,s.result signal,d.id decision_id,d.result decision FROM current_signals v JOIN assignments a ON a.id=v.assignment_id JOIN instruments i ON i.code=a.code JOIN signal_runs s ON s.id=v.signal_id JOIN personal_decisions d ON d.signal_id=s.id WHERE a.user_id=? AND a.active=1 AND d.id=(SELECT id FROM personal_decisions WHERE signal_id=s.id ORDER BY created_at DESC,id DESC LIMIT 1)", (self.user["id"],))
 
+    def trend_source(self, code, signal_id=None):
+        """Inspect saved evidence or read synced prices; never start a sync/AI job."""
+        if signal_id:
+            rows = self.store.rows('''SELECT i.name,d.manifest,v.spec,f.algorithm FROM signal_runs s
+                JOIN assignments a ON a.id=s.assignment_id JOIN instruments i ON i.code=a.code
+                JOIN datasets d ON d.id=s.dataset_id JOIN strategy_versions v ON v.id=a.strategy_id
+                JOIN feature_snapshots f ON f.id=s.feature_id
+                WHERE s.id=? AND a.user_id=? AND a.code=?''',(signal_id,self.user['id'],code))
+            if not rows:
+                raise PermissionError('不能查看其他用户或其他指数的巡检曲线')
+            row = rows[0]
+            return {'name':row['name'],'manifest':json.loads(row['manifest']),
+                    'spec':json.loads(row['spec']),'algorithm':row['algorithm']}
+        self._code(code)
+        row = self.store.rows('''SELECT i.name,v.spec FROM assignments a JOIN instruments i ON i.code=a.code
+            JOIN strategy_versions v ON v.id=a.strategy_id WHERE a.user_id=? AND a.code=?
+            ORDER BY a.active DESC,a.created_at DESC,a.id DESC LIMIT 1''',(self.user['id'],code))[0]
+        try:
+            manifest,_ = Evaluator(self.store).inputs(code)
+        except ValueError as exc:
+            if not str(exc).startswith('NO_DATA:'):
+                raise
+            manifest = {'code':code,'as_of':None,'sessions':[],'data':[]}
+        return {'name':row['name'],'manifest':manifest,'spec':json.loads(row['spec']),'algorithm':ALGORITHM}
+
     def decision_state(self, decision_id):
         from .decision_lifecycle import evidence_current, feedback
         uid = self.user['id']
