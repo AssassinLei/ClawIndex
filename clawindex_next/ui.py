@@ -306,7 +306,7 @@ def run():
                 radar_choice = radar_scope if radar_on else 'OFF'
                 if radar_choice!=radar_mode and guarded(lambda:svc.set_radar_channel(channel['id'],radar_choice)):
                     st.success('机会提醒设置已保存。')
-                st.caption('机会提醒单独选择，默认关闭。上方渠道关闭时也不发送；它与买入、卖出通知分开，不代表交易指令。')
+                st.caption('只推送当前仍有效、符合个人筛选偏好的机会，不推送撤销。同一行情日相同机会不重复发送；观察升级为条件满足时可补发一次。上方渠道关闭时也不发送。')
                 if radar_on and mode=='OFF':
                     st.warning('机会推送已配置，但此Webhook总开关仍关闭。请先在上方“推送方式”开启渠道，才会实际发送。')
                 from .ui_webhook_schedule import schedule_editor

@@ -88,7 +88,7 @@ def test_send_time_rechecks_channel_freshness_and_preferences(radar_seed,monkeyp
     assert all(r['status'] in ('CANCELLED','EXPIRED') for r in notices(db))
 
 
-def test_withdrawal_survives_ranking_change_before_condition_failure(radar_seed):
+def test_withdrawal_after_ranking_change_is_kept_in_system_only(radar_seed):
     db,a,*_ = radar_seed
     cid = a.set_channel(URL,'ready',mode='ALL')
     a.set_radar_channel(cid,'READY')
@@ -105,12 +105,12 @@ def test_withdrawal_survives_ranking_change_before_condition_failure(radar_seed)
     row['state']='REJECTED'
     publish(db,revised,T0+timedelta(minutes=2))
     withdrawn = [r for r in notices(db) if r['kind']=='WITHDRAWN']
-    assert len(withdrawn)==1 and withdrawn[0]['code']==code
+    assert not withdrawn
     while deliver(db,lambda *_:None,FixtureCalendar(),T0+timedelta(minutes=3)):pass
-    assert next(r for r in notices(db) if r['kind']=='WITHDRAWN')['status']=='SENT'
+    assert not [r for r in notices(db) if r['kind']=='WITHDRAWN']
     revised['sources'][code]['observation_max_id']+=1
     publish(db,revised,T0+timedelta(minutes=4))
-    assert len([r for r in notices(db) if r['kind']=='WITHDRAWN'])==1
+    assert not [r for r in notices(db) if r['kind']=='WITHDRAWN']
 
 
 def test_retry_is_bounded_and_raw_error_never_leaks(radar_seed):
