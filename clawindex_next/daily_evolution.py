@@ -8,13 +8,17 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .engine import validate_spec
-from .evolution import frozen_prefix, require_v2, stamp
+from .evolution import RESEARCH_VERSION, evidence_id, frozen_prefix, require_v2, stamp
 from .factors import authorized
 from .storage import canonical, digest
 from .validation import select_candidate
 
 
 MODE = 'DAILY_APPLY'
+
+
+def reuse_key(uid, code, day):
+    return f'daily_evolution_reuse:{uid}:{code}:{day}'
 
 
 def request(evolution, policy_id, instant=None):
@@ -37,6 +41,28 @@ def request(evolution, policy_id, instant=None):
         base = json.loads(assignment['spec'])
         if not authorized(base,payload['anchor_spec'],payload['config']):
             raise ValueError('现行规则超出研究范围，请先保存新的进化设置')
+        try:
+            manifest,quality = evolution.evaluator.inputs(policy['code'],instant)
+        except (ValueError,RuntimeError):
+            manifest,quality = None,None
+        if quality=='OK':
+            fingerprint = evidence_id(manifest,base,payload['config'])
+            prior = c.execute("""SELECT r.id,r.created_at FROM evolution_runs r
+                JOIN evolution_policies p ON p.id=r.policy_id
+                WHERE p.user_id=? AND p.code=? AND json_extract(r.payload,'$.mode')=?
+                AND r.status='REJECTED' AND r.cursor=json_array_length(r.payload,'$.plan')
+                AND json_array_length(r.payload,'$.plan')>0 AND json_extract(r.payload,'$.test_consumed')=1
+                AND (SELECT COUNT(*) FROM evolution_trials t WHERE t.run_id=r.id)=json_array_length(r.payload,'$.plan')
+                AND json_extract(r.payload,'$.research_version')=? AND json_extract(r.payload,'$.evidence_id')=?
+                ORDER BY r.created_at DESC,r.id DESC LIMIT 1""",
+                (policy['user_id'],policy['code'],MODE,RESEARCH_VERSION,fingerprint)).fetchone()
+            if prior:
+                receipt = {'run_id':prior['id'],'requested_at':stamp(instant),'original_requested_at':prior['created_at'],
+                           'as_of':manifest['as_of'],'evidence_id':fingerprint,'status':'REUSED',
+                           'reason':'可用行情、现行规则和研究设置未变化，复用已完成结果；未重新搜索或调整参数。'}
+                c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                          (reuse_key(policy['user_id'],policy['code'],day),canonical(receipt)))
+                return prior['id']
         rid = digest({'mode':MODE,'user':policy['user_id'],'code':policy['code'],'day':day})
         config = {'mode':MODE,'trigger':'MANUAL_DAILY','requested_day':day,'requested_at':stamp(instant),'policy':payload['config'],
                   'base_spec':base,'plan':[],'historical_only':True,'repeated_history':True,

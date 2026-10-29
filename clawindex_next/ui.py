@@ -210,6 +210,8 @@ def run():
                 if st.form_submit_button("保存基金映射"):
                     guarded(lambda:svc.set_mapping(selected["code"],dict(product_code=product,currency=pcurrency,source_url=source,verified=verified)))
     elif page == "策略与研究" and selected:
+        from .ui_assessment import assessment_panel
+        assessment_panel(svc,selected['code'])
         evolution_panel(svc,selected,guarded)
         with st.expander("高级：手动研究与规则配置"):
             from .factors import PROFILES

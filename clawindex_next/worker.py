@@ -22,6 +22,7 @@ class Worker:
         self.owner = owner or uuid.uuid4().hex
         self.stopping = threading.Event()
         self.last_progress = time.monotonic()
+        self.last_notice_check = None
         self.syncer = MarketSync(store,getattr(self.evaluator,"calendar",None) or MarketCalendar(),provider)
 
     def lease(self, name, seconds=300, instant=None):
@@ -108,6 +109,8 @@ class Worker:
                 if self.stopping.is_set():
                     break
                 self.pulse()
+                if interleave:
+                    self.notification_checkpoint()
                 try:
                     raw_item = self.store.rows('SELECT metadata FROM instruments WHERE code=?',(code,))[0]
                     if not json.loads(raw_item['metadata']).get('identity_verified'):
@@ -157,6 +160,7 @@ class Worker:
                         if self.stopping.is_set() or not self.run_job():
                             break
                         processed += 1
+                        self.notification_checkpoint()
         finally:
             self.release("scheduler")
         return processed
@@ -308,21 +312,43 @@ class Worker:
         self.mark_progress()
         return True
 
+    def notification_checkpoint(self, force=False, maximum=4):
+        """Bounded time-sensitive work, including opportunity Cron windows."""
+        point = time.monotonic()
+        if not force and self.last_notice_check is not None and point-self.last_notice_check<10:
+            return 0
+        self.last_notice_check = point
+        processed = 0
+        for _ in range(maximum):
+            if self.stopping.is_set() or not self.deliver():
+                break
+            processed += 1
+        if not self.stopping.is_set() and self.lease('radar_notices',seconds=120):
+            try:
+                from .radar_notifications import deliver
+                for _ in range(min(maximum,4)):
+                    if self.stopping.is_set():
+                        break
+                    with activity(self.store,self.owner,'notification'):
+                        if not deliver(self.store,self.sender,self.syncer.calendar):
+                            break
+                    processed += 1
+                    self.pulse()
+            finally:
+                self.release('radar_notices')
+        return processed
+
     def once(self):
         self.pulse()
         jobs = 0
-        deliveries = 0
-        # Check due notifications before potentially lengthy price/AI batches.
-        for _ in range(4):
-            if self.stopping.is_set() or not self.deliver():
-                break
-            deliveries += 1
+        deliveries = self.notification_checkpoint(force=True)
         # User requests already queued take priority over periodic refresh.
         for _ in range(20):
             if self.stopping.is_set(): break
             if not self.run_job():
                 break
             jobs += 1
+            deliveries += self.notification_checkpoint()
         jobs += self.schedule(interleave=True) or 0
         # Bounded batches keep scheduling and operator shutdown responsive.
         for _ in range(100):
@@ -331,24 +357,14 @@ class Worker:
             if not self.run_job():
                 break
             jobs += 1
+            deliveries += self.notification_checkpoint()
         for _ in range(100):
             if self.stopping.is_set(): break
             self.pulse()
             if not self.deliver():
                 break
             deliveries += 1
-        if not self.stopping.is_set() and self.lease('radar_notices',seconds=120):
-            try:
-                from .radar_notifications import deliver
-                for _ in range(4):
-                    if self.stopping.is_set():
-                        break
-                    with activity(self.store,self.owner,'notification'):
-                        if not deliver(self.store,self.sender,self.syncer.calendar):
-                            break
-                    self.pulse()
-            finally:
-                self.release('radar_notices')
+        deliveries += self.notification_checkpoint(force=True)
         if not self.stopping.is_set() and self.lease("evolution",seconds=300):
             try:
                 from .evolution import Evolution
@@ -369,6 +385,7 @@ class Worker:
                 self.store.health('radar','WAITING','机会雷达本轮暂未完成，后台将自动重试，已有监控继续运行。')
             finally:
                 self.release('opportunity_radar')
+        deliveries += self.notification_checkpoint(force=True)
         return {"jobs_processed":jobs,"deliveries_processed":deliveries}
 
     def wait_for_work(self, interval):

@@ -392,7 +392,7 @@ def test_ui_quick_execution_updates_only_explicitly_confirmed_state(seeded,monke
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1]/"app_next.py"),default_timeout=30).run()
     app.text_input[0].set_value("alice")
     next(x for x in app.button if x.label=="登录").click().run()
-    next(x for x in app.selectbox if x.label=="处理结果").set_value("EXECUTED")
+    next(x for x in app.selectbox if x.label=="处理结果").set_value("EXECUTED").run()
     next(x for x in app.checkbox if x.label=="同时确认成交后的真实持仓状态").check()
     next(x for x in app.button if x.label=="保存处理结果").click().run()
     assert not app.exception

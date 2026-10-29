@@ -341,6 +341,11 @@ class UserService:
     def results(self):
         return self.store.rows("SELECT a.code,i.name,s.id signal_id,s.as_of,s.result signal,d.id decision_id,d.result decision FROM current_signals v JOIN assignments a ON a.id=v.assignment_id JOIN instruments i ON i.code=a.code JOIN signal_runs s ON s.id=v.signal_id JOIN personal_decisions d ON d.signal_id=s.id WHERE a.user_id=? AND a.active=1 AND d.id=(SELECT id FROM personal_decisions WHERE signal_id=s.id ORDER BY created_at DESC,id DESC LIMIT 1)", (self.user["id"],))
 
+    def strategy_assessment(self, code):
+        self._code(code)
+        from .strategy_assessment import assessment
+        return assessment(self.store,self.user['id'],code)
+
     def trend_source(self, code, signal_id=None):
         """Inspect saved evidence or read synced prices; never start a sync/AI job."""
         if signal_id:

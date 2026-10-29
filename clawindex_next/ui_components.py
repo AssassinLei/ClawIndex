@@ -299,7 +299,9 @@ def today_details(svc, row, signal):
     st.caption('指数行情截至 '+row['as_of']+' · 收盘点位 '+number(feature.get('close'))+' · 近5日涨跌 '+number(feature.get('return5'),True))
     record = svc.saved_explanation(row['decision_id'])
     st.caption('当前解读：'+explanation_title(record))
-    selection = 'today_detail_'+row['decision_id']
+    # Decision IDs change after new evidence or daily expiry. Keep the user's
+    # selected view while rendering the replacement decision's own evidence.
+    selection = 'today_detail_'+str(svc.user['id'])+'_'+row['code']
     with st.container(horizontal=True):
         if st.button('查看数据',key='today_data_'+row['decision_id']):
             st.session_state[selection] = 'data'

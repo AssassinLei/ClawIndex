@@ -121,7 +121,16 @@ def select_candidate(reports, base_spec, policy):
     # Adjacent parameters must not imply a sharply isolated development optimum.
     from .factors import profile
     neighbours = [r for r in primary if r["spec"] != chosen["spec"] and r['spec']['name'] == chosen['spec']['name'] and profile(r['spec']) == profile(chosen['spec'])]
-    neighbour_ok = any(abs(segment(r,0,boundaries[1],annual)[0]["max_drawdown"])-abs(segment(chosen,0,boundaries[1],annual)[0]["max_drawdown"]) <= 2*policy["min_improvement"] for r in neighbours)
+    # A neighbour that merely stays in cash or sacrifices excessive return is
+    # not evidence of a stable investable region around the selected parameter.
+    neighbour_ok = False
+    incumbent = segment(baseline,0,boundaries[1],annual)[0]
+    chosen_drawdown = abs(segment(chosen,0,boundaries[1],annual)[0]['max_drawdown'])
+    for neighbour in neighbours:
+        c,h,m = segment(neighbour,0,boundaries[1],annual)
+        if not gates(c,incumbent,h,m,policy) and abs(c['max_drawdown'])-chosen_drawdown <= 2*policy['min_improvement']:
+            neighbour_ok = True
+            break
     reasons = sorted({v for check in checks for v in check["reasons"]})
     if not neighbour_ok:
         reasons.append("邻近参数稳定性不足")

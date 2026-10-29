@@ -5,11 +5,20 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from .engine import feature_frame, features_at, replay, step, validate_spec
+from .engine import ALGORITHM, feature_frame, features_at, replay, step, validate_spec
 from .research import backtest, metrics
 from .storage import canonical, digest
 from .validation import policy_config, select_candidate, curve_summary, gates
 from .factors import authorized, candidates, coverage, profile, diagnostics
+
+
+RESEARCH_VERSION = 'risk_validation_v2'
+
+
+def evidence_id(manifest, spec, policy):
+    """Fingerprint this index's actual evidence and experiment, never global IDs."""
+    return digest({'research_version':RESEARCH_VERSION,'feature_algorithm':ALGORITHM,
+                   'manifest':manifest,'spec':spec,'policy':policy})
 
 
 def stamp(instant=None):
@@ -116,7 +125,8 @@ class Evolution:
             raise ValueError('现行因子规则历史暂未完整，后台补齐后自动重试')
         plan = [{'spec':spec,'cost':cost,'delay':delay} for spec in variants for cost in costs for delay in delays]
         result = {'base_spec':base,'plan':plan,'factor_coverage':availability,'evaluation_start':manifest['sessions'][common],
-                  'policy':config,'data_cutoff':stamp(instant),'prefix_hash':frozen_prefix(manifest,manifest['as_of']),'test_consumed':False}
+                  'policy':config,'data_cutoff':stamp(instant),'prefix_hash':frozen_prefix(manifest,manifest['as_of']),'test_consumed':False,
+                  'research_version':RESEARCH_VERSION,'evidence_id':evidence_id(manifest,base,config)}
         if config.get('factor_research'):
             result['factor_diagnostics'] = diagnostics(frame,manifest['sessions'][common])
         return manifest,result
@@ -155,7 +165,7 @@ class Evolution:
             reserved = c.execute("SELECT COALESCE(SUM(json_array_length(r.payload,'$.plan')),0) FROM evolution_runs r JOIN evolution_policies p ON p.id=r.policy_id WHERE p.user_id=? AND p.code=? AND r.created_at>=? AND json_extract(r.payload,'$.mode') IS NULL", (policy["user_id"],policy["code"],stamp(instant-timedelta(days=365)))).fetchone()[0]
             if reserved+len(plan) > config["annual_trial_budget"]:
                 raise ValueError("已达年度试验预算，保留现行策略")
-            last = c.execute("SELECT created_at FROM evolution_runs WHERE policy_id=? AND json_extract(payload,'$.mode') IS NULL ORDER BY created_at DESC LIMIT 1", (policy_id,)).fetchone()
+            last = c.execute("SELECT r.created_at FROM evolution_runs r JOIN evolution_policies p ON p.id=r.policy_id WHERE p.user_id=? AND p.code=? AND json_extract(r.payload,'$.mode') IS NULL ORDER BY r.created_at DESC,r.id DESC LIMIT 1", (policy['user_id'],policy['code'])).fetchone()
             if last and instant-datetime.fromisoformat(last[0]) < timedelta(days=config["research_days"]):
                 raise ValueError("本研究周期已使用，不能反复筛选同一测试区间")
             c.execute("INSERT INTO evolution_runs(id,policy_id,assignment_id,status,manifest,payload,created_at,updated_at) VALUES(?,?,?,'PENDING',?,?,?,?)", (rid,policy_id,assignment["id"],canonical(manifest),canonical(run_payload),stamp(instant),stamp(instant)))
@@ -202,7 +212,7 @@ class Evolution:
                 manual = self.store.rows("SELECT r.id FROM evolution_runs r LEFT JOIN evolution_candidates k ON k.id=r.id WHERE r.policy_id=? AND json_extract(r.payload,'$.mode')='DAILY_APPLY' AND (r.status IN ('WAITING_DATA','PENDING','RUNNING') OR k.status='READY_TO_APPLY')",(row['id'],))
                 if manual:
                     continue
-                last = self.store.rows("SELECT created_at FROM evolution_runs WHERE policy_id=? AND json_extract(payload,'$.mode') IS NULL ORDER BY created_at DESC LIMIT 1", (row["id"],))
+                last = self.store.rows("SELECT r.created_at FROM evolution_runs r JOIN evolution_policies p ON p.id=r.policy_id WHERE p.user_id=? AND p.code=? AND json_extract(r.payload,'$.mode') IS NULL ORDER BY r.created_at DESC,r.id DESC LIMIT 1", (row['user_id'],row['code']))
                 if not last or instant-datetime.fromisoformat(last[0]["created_at"]) >= timedelta(days=config["research_days"]):
                     self.request(row["id"],instant)
             except (ValueError,RuntimeError):
@@ -265,6 +275,9 @@ class Evolution:
                 if quality != "OK":
                     chosen = None
                     assessment["reasons"].append("完成研究时行情已过期，下周期重新检查")
+                elif frozen_prefix(current,manifest['as_of']) != config['prefix_hash']:
+                    chosen = None
+                    assessment['reasons'].append('历史行情在研究期间发生修订，本轮结果不再用于冻结候选，保留现行规则')
                 else:
                     from .factors import entry_filter
                     for checked_spec in (chosen,config['base_spec']):

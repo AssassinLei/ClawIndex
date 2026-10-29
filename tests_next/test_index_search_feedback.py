@@ -85,6 +85,7 @@ def test_reason_choice_is_saved_without_requiring_free_text(seeded,monkeypatch,r
 def test_other_reason_requires_text_and_saves_it(seeded,monkeypatch):
     db,a,aid = ready(seeded,monkeypatch)
     app = login(db,monkeypatch)
+    next(x for x in app.selectbox if x.label=='处理结果').set_value('SUBMITTED').run()
     next(x for x in app.selectbox if x.label=='执行说明或暂缓原因').set_value('其他').run()
     assert any(x.label=='其他说明' for x in app.text_input)
     button(app,'保存处理结果').click().run()

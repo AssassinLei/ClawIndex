@@ -10,6 +10,7 @@ from .presentation import label, number, local_time, readable
 from .validation import DEFAULT_POLICY
 from .factors import PROFILES, TECH_FIELDS, coverage
 from .ui_design import card_heading, summary_stats, empty_state, navigate_button
+from .today_guidance import display_priority, handling, plan_context, research_reuse_message, summary_counts
 
 
 def evolution_step(latest, config):
@@ -172,12 +173,20 @@ def evolution_panel(svc, selected, guarded):
     config = saved["payload"]["config"] if saved else {**DEFAULT_POLICY,"ma_min":max(20,spec["ma"]-30),"ma_max":min(250,spec["ma"]+30)}
     config = {**DEFAULT_POLICY,**config,'factor_research':config.get('factor_research',False) if saved else True}
     if st.button('进化并应用',type='primary',key='daily_evolve_'+selected['code']):
+        clicked_at = datetime.now(timezone.utc)
         result = guarded(lambda:svc.evolve_daily(selected['code']))
         if result:
+            from .daily_evolution import reuse_key
+            day = clicked_at.astimezone(ZoneInfo('Asia/Hong_Kong')).date().isoformat()
+            receipt = svc.store.rows('SELECT value FROM settings WHERE key=?',(reuse_key(svc.user['id'],selected['code'],day),))
+            try:
+                reused = research_reuse_message(json.loads(receipt[0]['value']) if receipt else None,result,clicked_at)
+            except (TypeError,ValueError):
+                reused = None
             st.session_state['evolution_focus_'+selected['code']] = result
-            st.session_state.evolution_notice = {'code':selected['code'],'message':'进化请求已提交；同一天重复点击会展示同一任务，进行中的任务会复用。后台完成后在下方显示是否已更新。'}
+            st.session_state.evolution_notice = {'code':selected['code'],'message':reused or '进化请求已提交；同一天重复点击会展示同一任务，进行中的任务会复用。后台完成后在下方显示是否已更新。'}
             st.rerun()
-    st.caption('每天可主动进化一次（香港时间）；后台运行，可关闭网页。只调整当前账号的该指数规则，保留原提醒开关，不代替你下单。')
+    st.caption('每天可主动检查一次（香港时间）；相同数据、规则和授权下的已完成研究会复用，不重复搜参数。后台运行，可关闭网页；只调整当前账号的该指数规则，不代替你下单。')
     st.caption('每日进化依据历史检验，尚无后续行情验证；每天反复使用相近历史会增加过拟合风险。下方长期自动进化仍保留新行情模拟观察。')
     notice = st.session_state.get('evolution_notice')
     if notice and notice['code']==selected['code']:
@@ -280,7 +289,7 @@ def today_items(svc, code=None):
         handled = bool(feedback and feedback[0]["status"] in ("SUBMITTED","EXECUTED","PARTIAL","DEFERRED","CANCELLED","EXPIRED"))
         category = 'waiting' if not current or decision['status'] != 'AVAILABLE' else 'action' if decision['action'] in ('BUY','SELL') and not handled else 'quiet'
         items.append(dict(row=row,signal=signal,decision=decision,current=current,feedback=feedback,handled=handled,category=category))
-    return sorted(items, key=lambda item: {'action':0,'waiting':1,'quiet':2}[item['category']])
+    return sorted(items,key=display_priority)
 
 
 @st.fragment(run_every='5s')
@@ -290,11 +299,14 @@ def today_summary(svc):
     active = [j for j in svc.jobs() if j['status'] in ('PENDING','RUNNING','RETRY')]
     watches = svc.watchlist()
     awaiting = len({w['code'] for w in watches} - {item['row']['code'] for item in items})
+    counts = summary_counts(items,awaiting)
     summary_stats([
-        ("待你处理", sum(x['category']=='action' for x in items), "有效的买入 / 卖出判断"),
-        ("无需操作", sum(x['category']=='quiet' for x in items), "持有、等待或已处理"),
-        ("待更新或确认", sum(x['category']=='waiting' for x in items)+awaiting, "查看卡片中的具体原因"),
+        ("待你处理", counts['action'], "买卖判断，或已暂缓待决定"),
+        ("无需新动作", counts['quiet'], "持有、空仓等待或已确认成交"),
+        ("待更新或确认", counts['waiting'], "含待成交、部分成交及数据更新"),
     ])
+    if counts['followup']:
+        st.caption(f"有 {counts['followup']} 项只是暂缓、已提交或部分成交，尚未确认全部成交。查看对应卡片跟进，不代表需要重新下单。")
     if active:
         queue_panel(active)
 
@@ -312,7 +324,7 @@ def today_panel(svc, guarded):
             empty_state("从关注的第一个指数开始", "添加指数后，系统会自动维护数据、生成判断；未登记持仓默认空仓。")
             navigate_button("添加我的第一个指数", "监控与数据", "onboarding_watch")
             return
-    st.caption('待处理的指数优先展示；保存后卡片留在原位，重新打开页面时再排序。')
+    st.caption('尚未执行或已暂缓的退出优先展示；报单或部分成交先核对订单。保存后卡片留在原位，重新打开页面时再排序。')
     for item in items:
         today_card(svc,item['row']['code'],guarded)
     for watch in watches:
@@ -323,6 +335,11 @@ def today_panel(svc, guarded):
 EXECUTION_REASONS = ['按系统建议操作','我相信后面会涨','再观望下','暂时没有可用资金','已经手动处理','等待基金确认成交','其他']
 
 
+def execution_outcome_changed(decision_id):
+    if st.session_state.get('execution_outcome_'+decision_id) not in ('EXECUTED','PARTIAL'):
+        st.session_state['execution_position_'+decision_id] = False
+
+
 def save_today_execution(svc, code, decision_id, action):
     """Save before the card rerenders: no full-page rerun or list reordering."""
     outcome = st.session_state['execution_outcome_'+decision_id]
@@ -331,6 +348,10 @@ def save_today_execution(svc, code, decision_id, action):
     update = st.session_state.get('execution_position_'+decision_id,False)
     position = ('EMPTY' if action=='SELL' and outcome=='EXECUTED' else 'HELD') if update else None
     try:
+        if outcome not in ('SUBMITTED','EXECUTED','PARTIAL','DEFERRED'):
+            raise ValueError('请先选择实际处理结果；尚未下单可选择“暂缓”。')
+        if update and outcome not in ('EXECUTED','PARTIAL'):
+            raise ValueError('尚未确认成交，不能同步成交后的持仓。')
         if reason=='其他' and not note:
             raise ValueError('选择“其他”时，请填写说明。')
         svc.confirm_execution(decision_id,outcome,note,position)
@@ -364,13 +385,15 @@ def today_card(svc, code, guarded):
         watches = svc.watchlist()
         with st.container(border=True):
             action = decision['action']
-            title = "等待更新" if not item['current'] else label(decision['status']) if decision['status'] != 'AVAILABLE' else "已处理" if item['handled'] else label(action)
-            tone = 'attention' if group=='waiting' else action.lower() if group=='action' else 'quiet'
+            handled = handling(item['feedback'][0]['status'],action) if item['handled'] else None
+            title = "等待更新" if not item['current'] else label(decision['status']) if decision['status'] != 'AVAILABLE' else handled['title'] if handled else label(action)
+            tone = 'attention' if group=='waiting' or handled and handled['followup'] else action.lower() if group=='action' else 'quiet'
             card_heading(row['name'],row['code'],title,tone)
             notice = st.session_state.get('execution_saved_'+code)
             if notice:
                 (st.success if notice['ok'] else st.error)(notice['message'])
             st.caption("判断来源：程序规则 · 规则阶段："+label(signal['research_stage']))
+            st.caption('规则触发不等于已验证盈利；证据见“策略与进化”的策略体检。')
             if not item['current']:
                 st.warning("这是上次结果，暂不作为当前操作。后台更新完成后会自动替换。")
             elif decision['status'] != 'AVAILABLE':
@@ -382,7 +405,7 @@ def today_card(svc, code, guarded):
                         guarded(lambda:svc.submit(next(w['id'] for w in watches if w['code']==row['code']),refresh=True))
                         st.success('已提交重新巡检，结果会在此处更新。')
             elif item['handled']:
-                st.write("该操作已处理："+label(item['feedback'][0]['status'])+"。请勿重复下单。")
+                st.write(handled['text'])
                 st.caption("原操作："+label(action))
             elif action in ('BUY','SELL'):
                 st.write("**建议操作："+('买入' if action=='BUY' else '卖出')+"** · "+("参考金额 "+number(decision['amount'])+" "+label(decision['currency']) if decision['amount'] else "金额由你决定"))
@@ -393,12 +416,17 @@ def today_card(svc, code, guarded):
                     st.caption("；".join(readable(x) for x in decision['reasons']))
             if decision.get('position_basis') == 'DEFAULT_EMPTY':
                 st.caption('本条按默认空仓判断；如果实际持有，请到“我的持仓”更新。')
+            if item['current'] and decision['status']=='AVAILABLE':
+                context = plan_context(signal,decision)
+                if context['event']:
+                    st.caption(context['event'])
+                st.caption(context['validity'])
             if item['current'] and decision['status']=='AVAILABLE' and action in ('BUY','SELL') and svc.store.version>=2:
                 with st.expander('记录我的处理结果',key='execution_panel_'+code,on_change='rerun'):
                     st.caption("系统不自动下单。成交后可在这里同步确认真实持仓。")
-                    outcome = st.selectbox("处理结果",['SUBMITTED','EXECUTED','PARTIAL','DEFERRED'],format_func=label,key='execution_outcome_'+row['decision_id'])
+                    outcome = st.selectbox("处理结果",['SUBMITTED','EXECUTED','PARTIAL','DEFERRED'],index=None,placeholder='请选择实际处理结果',format_func=label,key='execution_outcome_'+row['decision_id'],on_change=execution_outcome_changed,args=(row['decision_id'],))
                     reason = st.selectbox('执行说明或暂缓原因',EXECUTION_REASONS,key='execution_reason_'+row['decision_id'])
                     note = st.text_input('其他说明',key='execution_other_'+row['decision_id']) if reason=='其他' else reason
-                    update = st.checkbox("同时确认成交后的真实持仓状态",key='execution_position_'+row['decision_id'],help="仅已成交/部分成交时可勾选。未填写的旧市值与份额会变为未知，现金需另行确认。")
-                    st.button('保存处理结果',key='execution_save_'+row['decision_id'],on_click=save_today_execution,args=(svc,code,row['decision_id'],action))
+                    update = st.checkbox("同时确认成交后的真实持仓状态",key='execution_position_'+row['decision_id'],disabled=outcome not in ('EXECUTED','PARTIAL'),help="仅已成交/部分成交时可勾选。未填写的旧市值与份额会变为未知，现金需另行确认。")
+                    st.button('保存处理结果',key='execution_save_'+row['decision_id'],disabled=outcome is None,on_click=save_today_execution,args=(svc,code,row['decision_id'],action))
             today_details(svc,row,signal)
