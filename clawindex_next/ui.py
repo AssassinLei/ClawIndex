@@ -173,6 +173,7 @@ def run():
                 if st.button("停止监控并保留历史"):
                     svc.unwatch(selected["id"])
                     st.rerun()
+                st.caption('停止监控也会停止该指数的待发送通知，并在机会雷达暂不关注它；以后可在“发现机会”恢复关注。')
     elif page == "持仓与预算" and selected:
         st.write("未登记默认空仓；真实持有时改为持有。状态保留到你修改或确认成交，无需每周复核，金额可留空。")
         old = svc.position(selected["code"])
@@ -222,9 +223,12 @@ def run():
             ma = st.number_input("均线交易日数",20,250,int(json.loads(selected["spec"])["ma"]))
             confirm = st.number_input("连续确认日数",1,10,int(json.loads(selected["spec"])["confirmation"]))
             slope = st.number_input("均线斜率跨度",1,20,int(json.loads(selected["spec"])["slope_window"]))
-            spec = {**DEFAULT_SPEC,"ma":int(ma),"confirmation":int(confirm),"slope_window":int(slope)}
+            spec = {**current_spec,"ma":int(ma),"confirmation":int(confirm),"slope_window":int(slope)}
             if choice != 'NONE':
                 spec.update(name='trend_factor_v2',factor_profile=choice)
+            else:
+                spec['name'] = 'trend_confirm_v1'
+                spec.pop('factor_profile',None)
             goal = st.text_input("研究目标",value="控制回撤并记录收益代价")
             if st.button("运行成本、延迟与邻近参数研究"):
                 with st.spinner("使用同一个规则引擎逐日回放；不自动选取或启用最赚钱参数"):
@@ -248,7 +252,7 @@ def run():
                     st.dataframe(pd.DataFrame([{"市场特征":label(k),"交易日数":v["sessions"],"策略平均日收益":number(v["strategy_mean_daily_return"],True),"持有平均日收益":number(v["buy_hold_mean_daily_return"],True)} for k,v in chosen["regime_performance"].items()]),hide_index=True)
                 st.download_button("下载完整研究报告",canonical(report),file_name="index-research.json",mime="application/json")
             stage = st.selectbox("规则使用阶段",["RESEARCH","SHADOW","ENABLED"],index=["RESEARCH","SHADOW","ENABLED"].index(selected["stage"]),format_func=label)
-            catchup = st.checkbox("空仓时允许追随当前仍有效的入场条件（非新信号）")
+            catchup = st.checkbox("空仓时允许追随当前仍有效的入场条件（非新信号）",value=bool(selected['catchup']))
             accepted = st.checkbox("我已审阅上述规则与研究限制；启用不代表有收益保证")
             if st.button("发布新规则版本并应用"):
                 if stage == "ENABLED" and not accepted:
@@ -372,6 +376,9 @@ def run():
                 svc.set_scheduler(choice)
         st.info("后台持续运行时才能自动更新与巡检。自动行情更新默认开启，自动巡检保留原设置，消息渠道由你单独开启。")
         st.caption('本账号自动巡检AI解读：'+('开启' if svc.inspection_ai_enabled() else '关闭')+'。可在“今日操作”的“巡检选项”修改，保存后自动巡检也会使用。')
+        ai_pause = svc.ai_availability()
+        if ai_pause:
+            st.info(ai_pause['message']+' 自动AI请求暂停至 '+local_time(ai_pause['retry_at'])+'；程序判断继续运行。恢复额度或修改配置后，可在指数详情单独重试AI。')
     elif page == "健康":
         if worker_status(db):
             st.success("后台服务最近10分钟内有运行心跳。页面的任务列表需要刷新后查看最新状态。")

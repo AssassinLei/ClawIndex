@@ -69,7 +69,7 @@ def historical_source(store, uid, code, spec, policy):
 
 def forward_checked(store, row, spec):
     """Recheck immutable observations, not a legacy ACTIVE status label."""
-    from .evolution import forward_assessment
+    from .evolution import forward_assessment,observed_history_matches
     try:
         payload,state = json.loads(row['candidate_payload']),json.loads(row['state'])
         policy = payload['policy']
@@ -83,6 +83,8 @@ def forward_checked(store, row, spec):
         observations = store.rows('SELECT as_of,payload FROM evolution_observations WHERE candidate_id=? ORDER BY as_of',(row['candidate_id'],))
         if (len(observations)!=policy['shadow_sessions'] or observations[-1]['as_of']!=state['last_as_of']
                 or observations[0]['as_of']<=payload['frozen_as_of']):
+            return False
+        if not observed_history_matches(store,row['candidate_id'],state):
             return False
         computed = forward_assessment([json.loads(o['payload']) for o in observations],policy,spec['annual_sessions'])
         return not computed['reasons']
@@ -158,7 +160,7 @@ def assessment(store, uid, code):
                               explanation='已通过当时授权的历史与新行情模拟检查；这仍是指数模型证据，不是未来盈利保证。')
             else:
                 result.update(level='APPLIED_UNVERIFIED',title='现行规则曾更新，前向证据待核实',
-                              explanation='更新记录仍保留，但固定观察期或逐日证据不完整，不能标记为前向检验通过。')
+                              explanation='更新记录与现行规则仍保留，但固定观察期、逐日数据版本或新版一致性校验记录不完整，不能标记为前向检验通过。')
         candidates = store.rows('''SELECT k.status,k.payload,k.state FROM evolution_candidates k
             JOIN evolution_runs r ON r.id=k.id JOIN evolution_policies p ON p.id=r.policy_id
             WHERE p.user_id=? AND p.code=? AND r.assignment_id=? AND p.active=1

@@ -41,7 +41,10 @@ def outcomes(store, calendar, instant=None, limit=200):
                     'cost_bps_per_side':10,'overlapping_samples':True,'basis':'DISCOVERY_PRICE_TRACKING'}
             if len(after)>=horizon:
                 window = after[:horizon]
-                if all(day in stock and day in benchmark and valid_price(stock[day]) and valid_price(benchmark[day]) for day in window):
+                if all(day in stock and day in benchmark
+                       and valid_price(stock[day]) and valid_price(benchmark[day])
+                       and stock[day].get('quality')!='LEGACY_PROVENANCE_UNKNOWN'
+                       and benchmark[day].get('quality')!='LEGACY_PROVENANCE_UNKNOWN' for day in window):
                     fee = .001
                     values = [1.]+[stock[day]['close']/stock[window[0]]['open']/(1+fee) for day in window]
                     values[-1] *= 1-fee

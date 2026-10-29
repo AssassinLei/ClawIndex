@@ -44,6 +44,16 @@ def expected(calendar, instant):
     return calendar.expected('XSHG',instant,210)
 
 
+def evidence_revision(store, items, day, instant):
+    """Only input revisions inside this radar's actual historical scope wake it."""
+    codes = sorted({BENCHMARK['code'],*(item['code'] for item in items)})
+    start = (pd.Timestamp(day)-pd.DateOffset(years=3)).date().isoformat()
+    return store.rows('SELECT MAX(id) n FROM observations WHERE code IN ('+
+                      ','.join('?' for _ in codes)+') AND trade_date>=? AND trade_date<=? '
+                      'AND (available_at IS NULL OR available_at<=?)',
+                      (*codes,start,day,instant.isoformat()))[0]['n']
+
+
 def load(store, item, day, instant, calendar):
     start = (pd.Timestamp(day)-pd.DateOffset(years=3)).date().isoformat()
     rows = store.rows('SELECT o.* FROM observations o WHERE code=? AND trade_date>=? AND trade_date<=? AND (available_at IS NULL OR available_at<=?) AND id=(SELECT MAX(id) FROM observations WHERE code=o.code AND trade_date=o.trade_date AND (available_at IS NULL OR available_at<=?)) ORDER BY trade_date',
@@ -256,9 +266,10 @@ class Radar:
             for item in [BENCHMARK,*items]:
                 insert_instrument(c,item)
         state = read(self.store,'radar:check',{})
-        revision = self.store.rows('SELECT MAX(id) n FROM observations WHERE trade_date<=? AND (available_at IS NULL OR available_at<=?)',(day,instant.isoformat()))[0]['n']
+        revision = evidence_revision(self.store,items,day,instant)
         signature = digest({'day':day,'universe':[(r['code'],r['metadata']) for r in items],'revision':revision,'rule':RULE_ID})
-        if state.get('signature')==signature and state.get('next_at','')>instant.isoformat() and not manual:
+        if (state.get('signature')==signature and state.get('next_at','')>instant.isoformat()
+                and (not manual or state.get('request')==manual)):
             return False
         # Only an empty/data-incomplete scan needs full history maintenance.
         maintenance_pending = self.maintain(items,day,instant,heartbeat)
@@ -275,9 +286,13 @@ class Radar:
         previous_health = self.store.rows("SELECT status,detail FROM health WHERE component='radar' AND user_id IS NULL ORDER BY id DESC LIMIT 1")
         if not previous_health or (previous_health[0]['status'],previous_health[0]['detail'])!=(health_status,progress['detail']):
             self.store.health('radar',health_status,progress['detail'])
-        revision = self.store.rows('SELECT MAX(id) n FROM observations WHERE trade_date<=? AND (available_at IS NULL OR available_at<=?)',(day,instant.isoformat()))[0]['n']
+        revision = evidence_revision(self.store,items,day,instant)
         signature = digest({'day':day,'universe':[(r['code'],r['metadata']) for r in items],'revision':revision,'rule':RULE_ID})
-        write(self.store,'radar:check',{'signature':signature,'next_at':(instant+timedelta(minutes=30) if report['status']=='COMPLETE' and not maintenance_pending else instant+timedelta(seconds=20)).isoformat()})
+        next_at = (instant+timedelta(minutes=30) if report['status']=='COMPLETE' and not maintenance_pending else instant+timedelta(seconds=20)).isoformat()
+        # No benefit in recalculating an unchanged incomplete universe while its
+        # provider is explicitly paused. Relevant new rows still bypass this cache.
+        next_at = max(next_at,cooldown.get('next_at',''))
+        write(self.store,'radar:check',{'signature':signature,'next_at':next_at,'request':manual})
         return changed
 
 

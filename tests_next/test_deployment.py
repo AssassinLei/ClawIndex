@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from clawindex_next.deployment import import_database, inspect_database
+from clawindex_next.cloud import backup
 from clawindex_next.storage import Store
 
 
@@ -43,6 +44,41 @@ def test_import_rejects_old_schema_without_creating_target(tmp_path):
     target=tmp_path/'next.db'
     with pytest.raises(ValueError,match='schema 2'):import_database(source,target)
     assert not target.exists()
+
+
+@pytest.mark.parametrize('table',['evolution_trials','evolution_observations','strategy_promotions',
+                                  'strategy_versions','datasets','current_signals','outbox'])
+def test_status_rejects_incomplete_schema_before_deploy_or_import(tmp_path,table):
+    path = tmp_path/'incomplete.db'
+    Store.create(path)
+    with sqlite3.connect(path) as c:
+        c.execute('DROP TABLE '+table)
+    with pytest.raises(sqlite3.DatabaseError):inspect_database(path)
+    target = tmp_path/'cloud'/'next.db'
+    with pytest.raises(sqlite3.DatabaseError):import_database(path,target)
+    assert not target.exists()
+
+
+def test_live_wal_backup_restores_committed_data_without_source_sidecars(seeded,tmp_path):
+    db,a,*_ = seeded
+    # Keep an older read snapshot alive so the new position really remains in
+    # committed WAL pages rather than being checkpointed into the main file.
+    with sqlite3.connect(db.path) as reader:
+        reader.execute('BEGIN')
+        assert reader.execute('SELECT COUNT(*) FROM position_reports').fetchone()[0]==0
+        a.report_position('HKTECH','HELD',{'shares':'12'})
+        assert Path(str(db.path)+'-wal').stat().st_size>0
+        output = tmp_path/'online-export.db'
+        assert backup(db,output)['integrity']=='ok'
+        assert reader.execute('SELECT COUNT(*) FROM position_reports').fetchone()[0]==0
+        # Restore only the exported database; no source WAL/SHM files travel.
+        restored = tmp_path/'independent'/'next.db'
+        assert import_database(output,restored)['state']=='IMPORTED'
+        cloud = Store(restored)
+        assert cloud.rows('SELECT * FROM position_reports')==db.rows('SELECT * FROM position_reports')
+        assert inspect_database(restored)['state']=='READY'
+        with pytest.raises(FileExistsError):import_database(output,restored)
+        assert cloud.rows('SELECT * FROM position_reports')==db.rows('SELECT * FROM position_reports')
 
 
 def test_import_publish_race_does_not_clobber_another_database(seeded,tmp_path,monkeypatch):

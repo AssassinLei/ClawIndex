@@ -36,6 +36,8 @@ def failure_diagnostic(exc, phase):
         code = 'TIMEOUT'
     elif name in ('APIConnectionError','ConnectError','ConnectionError'):
         code = 'CONNECTION'
+    elif status==429 and code in ('insufficient_quota','insufficient_balance','billing_hard_limit_reached'):
+        code = 'INSUFFICIENT_BALANCE'
     elif status in (401,402,403,404,429,400,422,408):
         code = {401:'AUTHENTICATION',402:'INSUFFICIENT_BALANCE',403:'PERMISSION',404:'MODEL_NOT_FOUND',429:'RATE_LIMIT',400:'BAD_REQUEST',422:'BAD_REQUEST',408:'TIMEOUT'}[status]
     elif isinstance(status,int) and status>=500:

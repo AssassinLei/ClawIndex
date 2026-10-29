@@ -13,6 +13,8 @@ from .factors import authorized, candidates, coverage, profile, diagnostics
 
 
 RESEARCH_VERSION = 'risk_validation_v2'
+FORWARD_EVIDENCE_VERSION = 'observed_history_v2'
+FORWARD_HISTORY_FAILURE = '已观察行情发生修订，或缺少新版一致性校验/逐日数据证据；保留现行策略，后续研究重新观察'
 
 
 def evidence_id(manifest, spec, policy):
@@ -32,6 +34,46 @@ def require_v2(store):
 
 def frozen_prefix(manifest, day):
     return digest([o for r,o in zip(manifest["data"],manifest["observations"]) if r["date"] <= day])
+
+
+def observed_history_matches(store, rid, state, manifest=None, instant=None):
+    """Keep prior forward observations tied to the history they actually saw."""
+    if not state.get('count'):
+        return True
+    # Older chains may already have mixed a corrected bar with an earlier
+    # portfolio mark. A matching final snapshot cannot prove those chains safe.
+    if state.get('history_guard_version')!=FORWARD_EVIDENCE_VERSION:
+        return False
+    rows = store.rows('''SELECT o.as_of,d.manifest FROM evolution_observations o
+        LEFT JOIN datasets d ON d.id=json_extract(o.payload,'$.dataset')
+        WHERE o.candidate_id=? ORDER BY o.as_of DESC LIMIT 1''',(rid,))
+    if not rows or not rows[0]['manifest'] or rows[0]['as_of']!=state.get('last_as_of'):
+        return False
+    try:
+        saved = json.loads(rows[0]['manifest'])
+    except (TypeError,ValueError):
+        return False
+    cutoff = state['last_as_of']
+    if (not isinstance(saved,dict) or saved.get('as_of')!=cutoff
+            or not all(k in saved for k in ('code','start','sessions','data','observations'))
+            or not all(isinstance(saved[k],list) for k in ('sessions','data','observations'))
+            or len(saved['data'])!=len(saved['observations'])
+            or not all(isinstance(r,dict) and 'date' in r for r in saved['data'])
+            or not all(isinstance(o,dict) and 'id' in o for o in saved['observations'])):
+        return False
+    if manifest is not None:
+        return (manifest['code']==saved['code'] and
+                [d for d in manifest['sessions'] if d<=cutoff]==saved['sessions'] and
+                frozen_prefix(manifest,cutoff)==frozen_prefix(saved,cutoff))
+    # The read-only evidence page may have no new inspection yet. Check the
+    # latest available revisions directly rather than trusting a stale signal.
+    instant = instant or datetime.now(timezone.utc)
+    latest = {r['trade_date']:r['id'] for r in store.rows('''SELECT trade_date,MAX(id) id
+        FROM observations WHERE code=? AND trade_date>=? AND trade_date<=?
+        AND (available_at IS NULL OR available_at<=?) GROUP BY trade_date''',
+        (saved['code'],saved['start'],cutoff,stamp(instant)))}
+    expected = {r['date']:o['id'] for r,o in zip(saved['data'],saved['observations'])}
+    return {d:latest[d] for d in saved['sessions'] if d in latest}==expected
 
 
 def forward_assessment(points, policy, annual=252):
@@ -296,7 +338,7 @@ class Evolution:
                             raise ValueError("冻结候选缺少完整有效窗口")
                         portfolios[name] = {"cash":1.,"units":0.,"model":signal["model_state"],"trigger":signal["triggered_at"],"pending":{"action":"BUY","remaining":config["policy"]["delay"]} if signal["model_state"] == "LONG" else None,"trades":0,"long_sessions":0}
                     payload = {"spec":chosen,"base_spec":config["base_spec"],"policy":config["policy"],"frozen_as_of":current["as_of"],"frozen_at":stamp(instant),"prefix_hash":frozen_prefix(current,current["as_of"]),"assessment":assessment,"basis":"INDEX_PROXY"}
-                    state = {**portfolios,"hold":{"cash":1.,"units":0.,"remaining":config["policy"]["delay"]},"last_as_of":current["as_of"],'last_observed_at':stamp(instant),"count":0}
+                    state = {**portfolios,"hold":{"cash":1.,"units":0.,"remaining":config["policy"]["delay"]},"last_as_of":current["as_of"],'last_observed_at':stamp(instant),"count":0,'history_guard_version':FORWARD_EVIDENCE_VERSION}
                     c.execute("INSERT OR IGNORE INTO evolution_candidates VALUES(?,'FORWARD_SHADOW',?,?,?,?)", (rid,canonical(payload),canonical(state),stamp(instant),stamp(instant)))
             config["assessment"] = assessment
             c.execute("UPDATE evolution_runs SET status=?,payload=?,updated_at=? WHERE id=?", ("FROZEN" if chosen else "REJECTED",canonical(config),stamp(instant),rid))
@@ -321,6 +363,9 @@ class Evolution:
             return
         if frozen_prefix(manifest,payload["frozen_as_of"]) != payload["prefix_hash"]:
             self.quarantine(rid,"冻结前的行情发生修订，禁止改写前向观察")
+            return
+        if not observed_history_matches(self.store,rid,state,manifest):
+            self.quarantine(rid,FORWARD_HISTORY_FAILURE)
             return
         from .factors import entry_filter
         for checked_spec in (payload['spec'],payload['base_spec']):
@@ -358,6 +403,7 @@ class Evolution:
         state["count"] += 1
         state["last_as_of"] = manifest["as_of"]
         state['last_observed_at'] = stamp(instant)
+        state['history_guard_version'] = FORWARD_EVIDENCE_VERSION
         status = "FORWARD_SHADOW"
         if state["count"] == payload["policy"]["shadow_sessions"]:
             points = [json.loads(x["payload"]) for x in self.store.rows("SELECT payload FROM evolution_observations WHERE candidate_id=? ORDER BY as_of", (rid,))]+[point]
@@ -413,6 +459,9 @@ class Evolution:
                 return False
             manifest,quality = self.evaluator.inputs(row["code"],instant)
             if quality != "OK" or state["last_as_of"] != manifest["as_of"] or frozen_prefix(manifest,payload["frozen_as_of"]) != payload["prefix_hash"]:
+                return False
+            if not observed_history_matches(self.store,rid,state,manifest):
+                c.execute("UPDATE evolution_candidates SET status='QUARANTINED',payload=json_set(payload,'$.quarantine_reason',?),updated_at=? WHERE id=?",(FORWARD_HISTORY_FAILURE,stamp(instant),rid))
                 return False
             sid = validate_spec(payload["spec"])
             c.execute("INSERT OR IGNORE INTO strategy_versions VALUES(?,?,?)", (sid,canonical(payload["spec"]),stamp(instant)))

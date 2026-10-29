@@ -51,7 +51,7 @@ def validate_explanation(raw, features):
     return result
 
 
-def explain(store, decision_id, provider=None, model="TEMPLATE"):
+def explain(store, decision_id, provider=None, model="TEMPLATE", force_retry=False):
     row = store.rows("SELECT d.result decision,s.result signal,f.payload features,d.user_id,a.code FROM personal_decisions d JOIN signal_runs s ON s.id=d.signal_id JOIN feature_snapshots f ON f.id=s.feature_id JOIN assignments a ON a.id=s.assignment_id WHERE d.id=?", (decision_id,))[0]
     payload = {k:json.loads(row[k]) for k in ('decision','signal','features')}
     # Audit IDs and timestamps change during old-history repair even when the
@@ -71,8 +71,16 @@ def explain(store, decision_id, provider=None, model="TEMPLATE"):
             reused = json.loads(cached[0]['payload'])
             reused['reuse'] = {'original_generated_at':reused.get('reuse',{}).get('original_generated_at',cached[0]['created_at'])}
     status,result = ("MODEL_OK",reused) if reused is not None else ("TEMPLATE",template)
+    blocked = None
+    if provider and reused is None and not force_retry:
+        from .ai_availability import paused
+        blocked = paused(store,model)
+        if blocked:
+            status = 'FAILED_TEMPLATE'
+            result = {**template,'diagnostic':{**blocked,'phase':'provider','retryable':True,
+                'message':blocked['message']+' 自动AI请求暂时暂停，程序判断继续运行；可单独重试AI。'}}
     lease,owner = None,uuid.uuid4().hex
-    if provider and reused is None:
+    if provider and reused is None and not blocked:
         lease = 'explanation:'+digest({'decision':decision_id,'input':input_hash,'model':model})
         instant = datetime.now(timezone.utc)
         with store.connect(True) as c:
@@ -84,18 +92,23 @@ def explain(store, decision_id, provider=None, model="TEMPLATE"):
                 raise ExplanationBusy('AI解读正在生成，请稍候，结果会自动保存')
             c.execute('INSERT INTO leases VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at',(lease,owner,(instant+timedelta(seconds=90)).isoformat()))
     try:
-        if provider and reused is None:
+        if provider and reused is None and not blocked:
             phase,started = 'provider',time.monotonic()
+            started_at = datetime.now(timezone.utc)
             try:
                 raw = provider(payload)
                 phase = 'validation'
                 result = validate_explanation(raw,payload["features"])
                 status = "MODEL_OK"
+                from .ai_availability import record_success
+                record_success(store,model,started_at)
             except Exception as exc:
                 status = "FAILED_TEMPLATE"
                 diagnostic = failure_diagnostic(exc,phase)
                 diagnostic['elapsed_ms'] = round((time.monotonic()-started)*1000)
                 result = {**template,'diagnostic':diagnostic}
+                from .ai_availability import record_failure
+                record_failure(store,model,diagnostic)
                 uid = store.rows('SELECT user_id FROM personal_decisions WHERE id=?',(decision_id,))[0]['user_id']
                 store.health("explanation","FAILED",canonical({'decision_id':decision_id,**diagnostic}),user_id=uid)
         with store.connect(True) as c:

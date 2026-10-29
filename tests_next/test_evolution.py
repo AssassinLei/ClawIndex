@@ -189,7 +189,12 @@ def eligible(db,rid,calendar):
     days = [d.date().isoformat() for d in pd.bdate_range(start=pd.Timestamp(payload["frozen_as_of"])+pd.offsets.BDay(),periods=payload["policy"]["shadow_sessions"])]
     for day in days:
         add_day(db,calendar,day)
+    # The real observer stores an immutable dataset reference per point. Keep
+    # this fast lifecycle fixture faithful to the final observed data version.
+    manifest,_ = Evaluator(db,calendar).inputs('HKTECH',datetime.fromisoformat(days[-1]+'T15:00:00+00:00'))
+    dataset = digest(manifest)
     with db.connect(True) as c:
+        c.execute('INSERT OR IGNORE INTO datasets VALUES(?,?,?,?,?)',(dataset,'HKTECH',manifest['as_of'],canonical(manifest),now()))
         row = c.execute("SELECT payload,state FROM evolution_candidates WHERE id=?", (rid,)).fetchone()
         payload,state = json.loads(row[0]),json.loads(row[1])
         payload["forward_assessment"] = {"reasons":[],"fixed_horizon":True}
@@ -197,6 +202,8 @@ def eligible(db,rid,calendar):
         state["last_as_of"] = days[-1]
         for i,day in enumerate(days):
             point = {"candidate":1.12 if i==30 else 1.1,"incumbent":1.15 if i==30 else 1.,"hold":1.15 if i==30 else 1.1,"candidate_trades":2 if i==len(days)-1 else 1,"incumbent_trades":2 if i==len(days)-1 else 1,"candidate_exposure":1 if i<len(days)-1 else 0,"incumbent_exposure":1 if i<len(days)-1 else 0}
+            if i==len(days)-1:
+                point['dataset']=dataset
             c.execute("INSERT INTO evolution_observations VALUES(?,?,?)", (rid,day,canonical(point)))
         c.execute("UPDATE evolution_candidates SET status='ELIGIBLE',payload=?,state=? WHERE id=?", (canonical(payload),canonical(state),rid))
     return datetime.fromisoformat(days[-1]+"T15:00:00+00:00")

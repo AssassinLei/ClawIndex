@@ -88,20 +88,25 @@ class UserService:
         return request(self.store,self.user['id'],MarketCalendar())
 
     def radar_preferences(self, hide_watched=None, ignore=None, restore=None):
-        from .radar import preferences, write, universe
+        from .radar import universe
         uid = self.user['id']
-        prefs = preferences(self.store,uid)
         if hide_watched is not None:
             if type(hide_watched) is not bool:
                 raise ValueError('显示偏好必须为开关')
-            prefs['hide_watched'] = hide_watched
         if ignore:
             if ignore not in {item['code'] for item in universe(self.store)}:
                 raise ValueError('该指数不在L1、L2雷达范围内')
-            prefs['ignored'] = sorted(set(prefs['ignored'])|{ignore})
-        if restore:
-            prefs['ignored'] = [code for code in prefs['ignored'] if code!=restore]
-        write(self.store,'radar:preferences:'+str(uid),prefs)
+        with self.store.connect(True) as c:
+            key = 'radar:preferences:'+str(uid)
+            row = c.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
+            prefs = json.loads(row[0]) if row else {'hide_watched':True,'ignored':[]}
+            if hide_watched is not None:
+                prefs['hide_watched'] = hide_watched
+            if ignore:
+                prefs['ignored'] = sorted(set(prefs['ignored'])|{ignore})
+            if restore:
+                prefs['ignored'] = [code for code in prefs['ignored'] if code!=restore]
+            c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,canonical(prefs)))
         return True
 
     def add_radar_watch(self, code):
@@ -155,7 +160,12 @@ class UserService:
         if not self.store.rows("SELECT id FROM personal_decisions WHERE id=? AND user_id=?", (decision_id,self.user["id"])):
             raise PermissionError("不能解释其他用户的记录")
         model = model_identity() if use_ai else "TEMPLATE"
-        return explain(self.store,decision_id,llm_explanation if use_ai else None,model)
+        return explain(self.store,decision_id,llm_explanation if use_ai else None,model,force_retry=use_ai)
+
+    def ai_availability(self):
+        self.user
+        from .ai_availability import paused
+        return paused(self.store,model_identity())
 
     def saved_explanation(self, decision_id):
         if not self.store.rows("SELECT id FROM personal_decisions WHERE id=? AND user_id=?", (decision_id,self.user["id"])):
@@ -165,9 +175,22 @@ class UserService:
         return {**rows[0],"payload":json.loads(rows[0]["payload"])} if rows else None
 
     def unwatch(self, assignment_id):
-        self._assignment(assignment_id)
+        assignment = self._assignment(assignment_id)
+        uid = self.user['id']
+        from .radar import universe
+        in_radar = any(item['code']==assignment['code'] for item in universe(self.store))
         with self.store.connect(True) as c:
-            c.execute("UPDATE assignments SET active=0 WHERE id=?", (assignment_id,))
+            changed = c.execute("UPDATE assignments SET active=0 WHERE id=? AND active=1", (assignment_id,)).rowcount
+            if not changed:
+                return
+            c.execute("UPDATE outbox SET status='EXPIRED',claim_owner=NULL,claim_until=NULL WHERE user_id=? AND decision_id IN (SELECT d.id FROM personal_decisions d JOIN signal_runs s ON s.id=d.signal_id WHERE s.assignment_id=?) AND status IN ('PENDING','RETRY','SENDING')",(uid,assignment_id))
+            if in_radar:
+                key = 'radar:preferences:'+str(uid)
+                row = c.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
+                prefs = json.loads(row[0]) if row else {'hide_watched':True,'ignored':[]}
+                prefs['ignored'] = sorted(set(prefs['ignored'])|{assignment['code']})
+                c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,canonical(prefs)))
+                c.execute("UPDATE settings SET value=json_set(value,'$.status','CANCELLED','$.claim_owner',NULL,'$.claim_until',NULL,'$.detail','用户已停止监控并暂不关注此机会。') WHERE key LIKE 'radar:notice:%' AND json_extract(value,'$.user_id')=? AND json_extract(value,'$.code')=? AND json_extract(value,'$.status') IN ('PENDING','RETRY','SENDING')",(uid,assignment['code']))
 
     def report_position(self, code, status, fields=None):
         self._code(code)

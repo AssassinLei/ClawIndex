@@ -272,6 +272,9 @@ def background_status_panel(svc):
 
 
 def ai_action(svc, decision_id, key_prefix, title='生成AI解读', refresh=True):
+    ai_pause = svc.ai_availability()
+    if ai_pause:
+        st.caption(ai_pause['message']+' 自动AI请求暂停至 '+local_time(ai_pause['retry_at'])+'；程序判断继续运行。下方按钮可立即尝试恢复。')
     if st.button(title,key=key_prefix+decision_id,help='已有成功解读会直接复用；失败后可重试。'):
         saved = svc.saved_explanation(decision_id)
         if saved and saved['status'] == 'MODEL_OK':

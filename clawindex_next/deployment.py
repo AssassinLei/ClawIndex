@@ -3,11 +3,18 @@ import argparse
 from contextlib import closing
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import uuid
 
-from .storage import Store, canonical
+from .storage import SCHEMA, Store, canonical
+from .upgrades import EVOLUTION_SCHEMA
+
+
+# These are checked from the application's own DDL so a schema number alone
+# cannot label a truncated/restored database ready for the running services.
+REQUIRED_TABLES = tuple(re.findall(r'CREATE TABLE (\w+)\(',SCHEMA+EVOLUTION_SCHEMA))
 
 
 def inspect_database(path):
@@ -22,7 +29,7 @@ def inspect_database(path):
             raise ValueError('需要schema 2的新版数据库；旧版库请先迁移，不会自动覆盖或初始化')
         if c.execute('PRAGMA quick_check').fetchone()[0]!='ok' or c.execute('PRAGMA foreign_key_check').fetchall():
             raise ValueError('数据库完整性或外键校验失败')
-        for table in ('users','assignments','observations','settings','evolution_runs','evolution_candidates','execution_confirmations'):
+        for table in REQUIRED_TABLES:
             c.execute(f'SELECT * FROM {table} LIMIT 0')
     return {'state':'READY','schema':2}
 
